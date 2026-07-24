@@ -84,7 +84,10 @@ type Manager struct {
 	mu              sync.RWMutex
 	connectors      map[string]Connector
 	defaultServerID string
+	tunnelMonStop   chan struct{}
 }
+
+const tunnelCheckInterval = 45 * time.Second
 
 var (
 	managerOnce sync.Once
@@ -105,12 +108,16 @@ func (m *Manager) ReloadFromServers(servers []shared.Fail2banServer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	old := m.connectors
 	connectors := make(map[string]Connector)
 	defaultID := pickDefaultServerID(servers)
 
 	for _, srv := range servers {
 		if !srv.Enabled {
 			continue
+		}
+		if oldSSH, ok := old[srv.ID].(*SSHConnector); ok && sshTunnelConfigChanged(oldSSH, srv) {
+			_ = oldSSH.Close()
 		}
 		conn, err := newConnectorForServer(srv)
 		if err != nil {
@@ -119,9 +126,81 @@ func (m *Manager) ReloadFromServers(servers []shared.Fail2banServer) error {
 		connectors[srv.ID] = conn
 	}
 
+	// Tear down tunneled masters of servers that were removed or disabled.
+	for id, conn := range old {
+		if _, still := connectors[id]; still {
+			continue
+		}
+		if oldSSH, ok := conn.(*SSHConnector); ok && oldSSH.tunnelPort > 0 {
+			_ = oldSSH.Close()
+		}
+	}
+
 	m.connectors = connectors
 	m.defaultServerID = defaultID
+	m.syncTunnelMonitorLocked()
 	return nil
+}
+
+// Starts or stops the tunnel health monitor
+func (m *Manager) syncTunnelMonitorLocked() {
+	hasTunnels := false
+	for _, conn := range m.connectors {
+		if sc, ok := conn.(*SSHConnector); ok && sc.tunnelPort > 0 {
+			hasTunnels = true
+			break
+		}
+	}
+	switch {
+	case hasTunnels && m.tunnelMonStop == nil:
+		m.tunnelMonStop = make(chan struct{})
+		go m.tunnelMonitorLoop(m.tunnelMonStop)
+		log.Printf("reverse tunnel health monitor started (interval %s)", tunnelCheckInterval)
+	case !hasTunnels && m.tunnelMonStop != nil:
+		close(m.tunnelMonStop)
+		m.tunnelMonStop = nil
+		log.Printf("reverse tunnel health monitor stopped (no tunneled servers)")
+	}
+}
+
+// Periodically verifies reverse-tunnel SSH masters and re-establishes dead ones.
+func (m *Manager) tunnelMonitorLoop(stop <-chan struct{}) {
+	ticker := time.NewTicker(tunnelCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+			m.CheckTunnels(ctx)
+			cancel()
+		}
+	}
+}
+
+// Runs the reverse-tunnel health check for every SSH connector with an active tunnel
+func (m *Manager) CheckTunnels(ctx context.Context) {
+	m.mu.RLock()
+	var tunneled []*SSHConnector
+	for _, conn := range m.connectors {
+		if sc, ok := conn.(*SSHConnector); ok && sc.tunnelPort > 0 {
+			tunneled = append(tunneled, sc)
+		}
+	}
+	m.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, sc := range tunneled {
+		wg.Add(1)
+		go func(sc *SSHConnector) {
+			defer wg.Done()
+			checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			sc.CheckTunnelHealth(checkCtx)
+		}(sc)
+	}
+	wg.Wait()
 }
 
 func pickDefaultServerID(servers []shared.Fail2banServer) string {

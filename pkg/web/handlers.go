@@ -1249,21 +1249,34 @@ func UpsertServerHandler(c *gin.Context) {
 
 	server, err := config.UpsertServer(req)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		resp := gin.H{"error": err.Error()}
+		if errors.Is(err, config.ErrInvalidTunnelPort) {
+			resp["messageKey"] = "servers.errors.invalid_tunnel_port"
+		}
+		c.JSON(http.StatusBadRequest, resp)
 		return
 	}
 
 	// Check if server was just enabled (transition from disabled to enabled)
 	justEnabled := wasDisabled && server.Enabled
+	tunnelChanged := wasEnabled && oldServer.Enabled && server.Enabled &&
+		(oldServer.ReverseTunnelEnabled != server.ReverseTunnelEnabled || oldServer.TunnelPort != server.TunnelPort)
 
 	if err := config.ReloadFail2banManager(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	if justEnabled && (server.Type == "ssh" || server.Type == "agent") {
+	if (justEnabled || tunnelChanged) && (server.Type == "ssh" || server.Type == "agent") {
 		if err := fail2ban.GetManager().UpdateActionFileForServer(c.Request.Context(), server.ID); err != nil {
 			config.DebugLog("Warning: failed to update action file for server %s: %v", server.Name, err)
+		}
+		if tunnelChanged {
+			if conn, err := fail2ban.GetManager().Connector(server.ID); err == nil {
+				if err := conn.Reload(c.Request.Context()); err != nil {
+					config.DebugLog("Warning: failed to reload fail2ban on server %s after tunnel change: %v", server.Name, err)
+				}
+			}
 		}
 	}
 
