@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,6 +49,10 @@ type SSHConnector struct {
 	pathCached   bool
 	pathMutex    sync.RWMutex
 	tunnelPort   int
+	forwardPort  int
+	tunnelMu     sync.Mutex
+	tunnelWasUp  bool
+	closed       atomic.Bool
 }
 
 const sshEnsureActionScript = `python3 - <<'PY'
@@ -87,21 +91,10 @@ func NewSSHConnector(server shared.Fail2banServer) (Connector, error) {
 	}
 	conn := &SSHConnector{server: server}
 
-	// Parse tunnel port from callback URL when reverse tunnel is enabled
 	if server.ReverseTunnelEnabled {
-		callbackURL := mustProvider().CallbackURL()
-		parsedURL, err := url.Parse(callbackURL)
-		if err == nil {
-			conn.tunnelPort = callbackTunnelPort(parsedURL)
-		}
-		if conn.tunnelPort == 0 {
-			log.Printf("warning: reverse tunnel enabled for server %s but no usable port could be derived from callback URL %q - tunnel disabled", server.Name, callbackURL)
-		} else {
-			if host := parsedURL.Hostname(); host != "localhost" && host != "127.0.0.1" && host != "::1" {
-				log.Printf("warning: reverse tunnel for server %s forwards localhost:%d, but the callback URL points to host %q - the remote fail2ban will bypass the tunnel unless the callback URL host is localhost", server.Name, conn.tunnelPort, host)
-			}
-			debugf("Reverse tunnel enabled for server %s, will use -R %d:localhost:%d", server.Name, conn.tunnelPort, conn.tunnelPort)
-		}
+		conn.tunnelPort = resolveTunnelPort(server)
+		conn.forwardPort = uiServerPort()
+		debugf("Reverse tunnel enabled for server %s, will use -R %d:localhost:%d", server.Name, conn.tunnelPort, conn.forwardPort)
 	}
 
 	// Use a timeout context to prevent hanging if SSH server isn't ready yet
@@ -115,19 +108,23 @@ func NewSSHConnector(server shared.Fail2banServer) (Connector, error) {
 	return conn, nil
 }
 
-// callbackTunnelPort derives the port the reverse tunnel has to forward from
-// the callback URL: the explicit port if present, otherwise the scheme default.
-func callbackTunnelPort(u *url.URL) int {
-	if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 && p <= 65535 {
+// Return the UI's configured listen port ("Server Port" setting)
+func uiServerPort() int {
+	if p := mustProvider().ServerPort(); p > 0 {
 		return p
 	}
-	switch u.Scheme {
-	case "https":
-		return 443
-	case "http":
-		return 80
+	return 8080
+}
+
+// Return the port bound on the remote host for the reverse tunnel
+func resolveTunnelPort(server shared.Fail2banServer) int {
+	if server.TunnelPort >= 1024 && server.TunnelPort <= 65535 {
+		return server.TunnelPort
 	}
-	return 0
+	if server.TunnelPort != 0 {
+		log.Printf("warning: invalid tunnelPort %d for server %s, falling back to the UI port", server.TunnelPort, server.Name)
+	}
+	return uiServerPort()
 }
 
 // =========================================================================
@@ -160,6 +157,89 @@ func (sc *SSHConnector) warmControlMaster(ctx context.Context) {
 	if _, err := sc.runRemoteCommand(ctx, []string{"true"}); err != nil {
 		debugf("SSH control master warm-up failed for %s: %v", sc.server.Name, err)
 	}
+}
+
+// Verifies the SSH ControlMaster if the reverse tunnel is alive (ssh -O check) and re-establish when it is not.
+func (sc *SSHConnector) CheckTunnelHealth(ctx context.Context) {
+	if sc.tunnelPort == 0 || sc.closed.Load() {
+		return
+	}
+	if !sc.tunnelMu.TryLock() {
+		return
+	}
+	defer sc.tunnelMu.Unlock()
+
+	check := exec.CommandContext(ctx, "ssh", "-O", "check", "-o", "ControlPath="+sc.controlPath(), sc.sshTarget())
+	if err := check.Run(); err == nil {
+		if !sc.tunnelWasUp {
+			log.Printf("reverse tunnel for server %s is up (port %d)", sc.server.Name, sc.tunnelPort)
+		}
+		sc.tunnelWasUp = true
+		return
+	}
+
+	if sc.tunnelWasUp {
+		log.Printf("reverse tunnel master for server %s is down, re-establishing", sc.server.Name)
+	}
+	sc.tunnelWasUp = false
+	if sc.closed.Load() {
+		return
+	}
+
+	sc.warmControlMaster(ctx)
+	if sc.closed.Load() {
+		sc.exitControlMaster()
+		return
+	}
+	recheck := exec.CommandContext(ctx, "ssh", "-O", "check", "-o", "ControlPath="+sc.controlPath(), sc.sshTarget())
+	if err := recheck.Run(); err == nil {
+		log.Printf("reverse tunnel for server %s re-established (port %d)", sc.server.Name, sc.tunnelPort)
+		sc.tunnelWasUp = true
+	} else {
+		debugf("reverse tunnel for server %s still down after re-dial: %v", sc.server.Name, err)
+	}
+}
+
+// Terminates the SSH ControlMaster via its local control socket
+func (sc *SSHConnector) exitControlMaster() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// -O -> exit only talks to the local control socket.
+	cmd := exec.CommandContext(ctx, "ssh", "-O", "exit", "-o", "ControlPath="+sc.controlPath(), sc.sshTarget())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		msg := strings.ToLower(string(out))
+		if !strings.Contains(msg, "no such file") && !strings.Contains(msg, "control socket connect") {
+			debugf("failed to close SSH control master for %s: %v (%s)", sc.server.Name, err, strings.TrimSpace(string(out)))
+		}
+		return
+	}
+	debugf("closed SSH control master for %s", sc.server.Name)
+}
+
+func (sc *SSHConnector) Close() error {
+	sc.closed.Store(true)
+	if !sc.tunnelMu.TryLock() {
+		return nil
+	}
+	defer sc.tunnelMu.Unlock()
+	sc.exitControlMaster()
+	return nil
+}
+
+// Report whether the replacement server config requires tearing down the existing ControlMaster
+func sshTunnelConfigChanged(old *SSHConnector, srv shared.Fail2banServer) bool {
+	newTunnel := srv.Type == "ssh" && srv.ReverseTunnelEnabled
+	if old.tunnelPort == 0 {
+		return newTunnel
+	}
+	if !newTunnel {
+		return true
+	}
+	if resolveTunnelPort(srv) != old.tunnelPort {
+		return true
+	}
+	o := old.server
+	return srv.Host != o.Host || srv.Port != o.Port || srv.SSHUser != o.SSHUser || srv.SSHKeyPath != o.SSHKeyPath
 }
 
 // Get banned IPs for a given jail.
@@ -296,8 +376,7 @@ func (sc *SSHConnector) SetFilterConfig(ctx context.Context, filterName, content
 
 func (sc *SSHConnector) ensureAction(ctx context.Context) error {
 	p := mustProvider()
-	callbackURL := p.CallbackURL()
-	actionConfig := p.BuildFail2banActionConfig(callbackURL, sc.server.ID, p.CallbackSecret())
+	actionConfig := p.BuildFail2banActionConfig(sc.actionCallbackURL(), sc.server.ID, p.CallbackSecret())
 	payload := base64.StdEncoding.EncodeToString([]byte(actionConfig))
 	script := strings.ReplaceAll(sshEnsureActionScript, "__PAYLOAD__", payload)
 	scriptB64 := base64.StdEncoding.EncodeToString([]byte(script))
@@ -476,6 +555,26 @@ func (sc *SSHConnector) runRemoteCommand(ctx context.Context, command []string) 
 	}
 }
 
+// Returns the callback URL to embed in this server's action file.
+// The loopback tunnel endpoint when a reverse tunnel is active, otherwise the global callback URL
+func (sc *SSHConnector) actionCallbackURL() string {
+	if sc.tunnelPort > 0 {
+		return fmt.Sprintf("http://localhost:%d", sc.tunnelPort)
+	}
+	return mustProvider().CallbackURL()
+}
+
+func (sc *SSHConnector) controlPath() string {
+	return fmt.Sprintf("/tmp/ssh_control_%s_%s", sc.server.ID, strings.ReplaceAll(sc.server.Host, ".", "_"))
+}
+
+func (sc *SSHConnector) sshTarget() string {
+	if sc.server.SSHUser != "" {
+		return fmt.Sprintf("%s@%s", sc.server.SSHUser, sc.server.Host)
+	}
+	return sc.server.Host
+}
+
 func (sc *SSHConnector) buildSSHArgs(command []string) []string {
 	args := []string{"-o", "BatchMode=yes"}
 	args = append(args,
@@ -490,7 +589,6 @@ func (sc *SSHConnector) buildSSHArgs(command []string) []string {
 			"-o", "LogLevel=ERROR",
 		)
 	}
-	controlPath := fmt.Sprintf("/tmp/ssh_control_%s_%s", sc.server.ID, strings.ReplaceAll(sc.server.Host, ".", "_"))
 	// ControlPersist=0 keeps the master SSH process (and with it the reverse
 	// tunnel) alive indefinitely; without a tunnel it expires after 300s.
 	controlPersist := "ControlPersist=300"
@@ -499,11 +597,13 @@ func (sc *SSHConnector) buildSSHArgs(command []string) []string {
 	}
 	args = append(args,
 		"-o", "ControlMaster=auto",
-		"-o", fmt.Sprintf("ControlPath=%s", controlPath),
+		"-o", fmt.Sprintf("ControlPath=%s", sc.controlPath()),
 		"-o", controlPersist,
 	)
 	if sc.tunnelPort > 0 {
-		tunnelArg := fmt.Sprintf("%d:localhost:%d", sc.tunnelPort, sc.tunnelPort)
+		// Remote side binds tunnelPort (the action file posts there); the
+		// UI side forwards to the port the HTTP server actually listens on.
+		tunnelArg := fmt.Sprintf("%d:localhost:%d", sc.tunnelPort, sc.forwardPort)
 		args = append(args, "-R", tunnelArg)
 		debugf("SSH reverse tunnel enabled: -R %s with %s (indefinite)", tunnelArg, controlPersist)
 	}
@@ -513,11 +613,7 @@ func (sc *SSHConnector) buildSSHArgs(command []string) []string {
 	if sc.server.Port > 0 {
 		args = append(args, "-p", strconv.Itoa(sc.server.Port))
 	}
-	target := sc.server.Host
-	if sc.server.SSHUser != "" {
-		target = fmt.Sprintf("%s@%s", sc.server.SSHUser, target)
-	}
-	args = append(args, target)
+	args = append(args, sc.sshTarget())
 	args = append(args, command...)
 	return args
 }
