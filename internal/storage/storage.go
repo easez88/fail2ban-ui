@@ -236,6 +236,7 @@ type ServerRecord struct {
 	IsDefault            bool
 	Enabled              bool
 	ReverseTunnelEnabled bool
+	TunnelPort           int
 	NeedsRestart         bool
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
@@ -592,7 +593,7 @@ func ListServers(ctx context.Context) ([]ServerRecord, error) {
 	}
 
 	rows, err := db.QueryContext(ctx, `
-SELECT id, name, type, host, port, socket_path, config_path, ssh_user, ssh_key_path, agent_url, agent_secret, hostname, tags, is_default, enabled, reverse_tunnel, needs_restart, created_at, updated_at
+SELECT id, name, type, host, port, socket_path, config_path, ssh_user, ssh_key_path, agent_url, agent_secret, hostname, tags, is_default, enabled, reverse_tunnel, tunnel_port, needs_restart, created_at, updated_at
 FROM servers
 ORDER BY created_at`)
 	if err != nil {
@@ -606,7 +607,7 @@ ORDER BY created_at`)
 		var host, socket, configPath, sshUser, sshKey, agentURL, agentSecret, hostname, tags sql.NullString
 		var name, serverType sql.NullString
 		var created, updated sql.NullString
-		var port sql.NullInt64
+		var port, tunnelPort sql.NullInt64
 		var isDefault, enabled, reverseTunnel, needsRestart sql.NullInt64
 
 		if err := rows.Scan(
@@ -626,6 +627,7 @@ ORDER BY created_at`)
 			&isDefault,
 			&enabled,
 			&reverseTunnel,
+			&tunnelPort,
 			&needsRestart,
 			&created,
 			&updated,
@@ -648,6 +650,7 @@ ORDER BY created_at`)
 		rec.IsDefault = intToBool(intFromNull(isDefault))
 		rec.Enabled = intToBool(intFromNull(enabled))
 		rec.ReverseTunnelEnabled = intToBool(intFromNull(reverseTunnel))
+		rec.TunnelPort = intFromNull(tunnelPort)
 		rec.NeedsRestart = intToBool(intFromNull(needsRestart))
 
 		if created.Valid {
@@ -688,9 +691,9 @@ func ReplaceServers(ctx context.Context, servers []ServerRecord) error {
 
 	stmt, err := tx.PrepareContext(ctx, `
 INSERT INTO servers (
-	id, name, type, host, port, socket_path, config_path, ssh_user, ssh_key_path, agent_url, agent_secret, hostname, tags, is_default, enabled, reverse_tunnel, needs_restart, created_at, updated_at
+	id, name, type, host, port, socket_path, config_path, ssh_user, ssh_key_path, agent_url, agent_secret, hostname, tags, is_default, enabled, reverse_tunnel, tunnel_port, needs_restart, created_at, updated_at
 ) VALUES (
-	?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+	?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )`)
 	if err != nil {
 		return err
@@ -723,6 +726,7 @@ INSERT INTO servers (
 			boolToInt(srv.IsDefault),
 			boolToInt(srv.Enabled),
 			boolToInt(srv.ReverseTunnelEnabled),
+			srv.TunnelPort,
 			boolToInt(srv.NeedsRestart),
 			createdAt.Format(time.RFC3339Nano),
 			updatedAt.Format(time.RFC3339Nano),
@@ -1577,6 +1581,7 @@ CREATE TABLE IF NOT EXISTS servers (
 	is_default INTEGER,
 	enabled INTEGER,
 	reverse_tunnel INTEGER DEFAULT 0,
+	tunnel_port INTEGER DEFAULT 0,
 	needs_restart INTEGER DEFAULT 0,
 	created_at TEXT,
 	updated_at TEXT
@@ -1643,6 +1648,7 @@ CREATE INDEX IF NOT EXISTS idx_perm_blocks_updated_at ON permanent_blocks(update
 		`ALTER TABLE servers ADD COLUMN reverse_tunnel INTEGER DEFAULT 0`,
 		`ALTER TABLE app_settings ADD COLUMN event_retention_days INTEGER DEFAULT 180`,
 		`ALTER TABLE ban_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'ban'`,
+		`ALTER TABLE servers ADD COLUMN tunnel_port INTEGER DEFAULT 0`,
 	}
 
 	if _, err := db.ExecContext(ctx, createTables); err != nil {

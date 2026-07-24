@@ -151,6 +151,7 @@ func TestReplaceServersRoundTrip(t *testing.T) {
 		IsDefault:            true,
 		Enabled:              true,
 		ReverseTunnelEnabled: true,
+		TunnelPort:           8443,
 		CreatedAt:            time.Date(2026, 5, 27, 14, 30, 0, 0, time.UTC),
 		UpdatedAt:            time.Date(2026, 5, 27, 15, 0, 0, 0, time.UTC),
 	}
