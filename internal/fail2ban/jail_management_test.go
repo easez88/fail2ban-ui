@@ -118,3 +118,20 @@ func TestUpdateJailEnabledStatesCreatesFileWhenUndefined(t *testing.T) {
 		t.Fatalf("sshd.local content unexpected:\n%s", content)
 	}
 }
+
+func TestContainsJailSection(t *testing.T) {
+	content := "# comment\n[swissmakers-apache-scanner]\nenabled = true\n"
+	if !containsJailSection(content, "swissmakers-apache-scanner") {
+		t.Fatal("expected section to be found")
+	}
+	if containsJailSection(content, "other-jail") {
+		t.Fatal("did not expect section for other jail")
+	}
+	garbled := "mux_client_request_session: session request failed\nControlSocket /tmp/x already exists\n"
+	if containsJailSection(garbled, "swissmakers-apache-scanner") {
+		t.Fatal("garbled content must not contain the jail section")
+	}
+	if !containsJailSection("  [j1]  \n", "j1") {
+		t.Fatal("expected trimmed section header to match")
+	}
+}

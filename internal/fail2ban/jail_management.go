@@ -18,6 +18,7 @@ package fail2ban
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,8 @@ import (
 	"sync"
 	"time"
 )
+
+var ErrLogpathInaccessible = errors.New("logpath directory not accessible to the connector")
 
 func ensureJailLocalFile(jailName, configPath string) error {
 	jailName = strings.TrimSpace(jailName)
@@ -501,6 +504,15 @@ func setJailEnabledInFile(jailFilePath, jailName string, enabled bool) error {
 	return nil
 }
 
+func containsJailSection(content, jailName string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == "["+jailName+"]" {
+			return true
+		}
+	}
+	return false
+}
+
 // Rewrites (or inserts) the enabled line of the [jailName] section in the given file content
 // Shared by the local and SSH connectors
 func rewriteJailEnabled(content, jailName string, enabled bool) string {
@@ -718,6 +730,11 @@ func TestLogpath(logpath string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid glob pattern: %w", err)
 		}
+		if len(matched) == 0 {
+			if _, statErr := os.ReadDir(filepath.Dir(logpath)); statErr != nil && os.IsPermission(statErr) {
+				return nil, ErrLogpathInaccessible
+			}
+		}
 		matches = matched
 	} else {
 		info, err := os.Stat(logpath)
@@ -725,12 +742,18 @@ func TestLogpath(logpath string) ([]string, error) {
 			if os.IsNotExist(err) {
 				return []string{}, nil
 			}
+			if os.IsPermission(err) {
+				return nil, ErrLogpathInaccessible
+			}
 			return nil, fmt.Errorf("failed to stat path: %w", err)
 		}
 
 		if info.IsDir() {
 			entries, err := os.ReadDir(logpath)
 			if err != nil {
+				if os.IsPermission(err) {
+					return nil, ErrLogpathInaccessible
+				}
 				return nil, fmt.Errorf("failed to read directory: %w", err)
 			}
 			for _, entry := range entries {
