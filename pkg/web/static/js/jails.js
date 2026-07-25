@@ -199,7 +199,7 @@ function saveManageJailsSingle(checkbox) {
           }
           loadServers().then(function() {
             updateRestartBanner();
-            return refreshData({ silent: true });
+            return refreshData({ silent: true, summaryOnly: true });
           });
         });
       }
@@ -228,7 +228,7 @@ function saveManageJailsSingle(checkbox) {
         }
         loadServers().then(function() {
           updateRestartBanner();
-          return refreshData({ silent: true });
+          return refreshData({ silent: true, summaryOnly: true });
         });
       });
     })
@@ -404,6 +404,8 @@ function testLogpath() {
         var found = result.found || false;
         var files = result.files || [];
         var error = result.error || '';
+        var inaccessible = result.inaccessible || false;
+        var message = result.message || '';
 
         if (idx > 0) {
           output += '<div class="my-4 border-t border-gray-300 pt-4"></div>';
@@ -432,6 +434,11 @@ function testLogpath() {
           output += '<span class="text-green-600 text-sm">'
             + t('jails.logpath_test.found_files', 'Found {count} file(s)').replace('{count}', files.length)
             + '</span>';
+        } else if (inaccessible) {
+          output += '<span class="text-yellow-600 font-bold">&#9888;</span>';
+          output += '<span class="text-yellow-600 text-sm">'
+            + escapeHtml(message || t('jails.logpath_test.inaccessible', 'Cannot verify: the log directory is not readable by the connectors SSH user. Fail2Ban runs as root and will read it, so the jail can still be enabled.'))
+            + '</span>';
         } else {
           output += '<span class="text-red-600 font-bold">&#10007;</span>';
           if (isLocalServer) {
@@ -453,9 +460,13 @@ function testLogpath() {
 
       var allFound = results.every(function(r) { return r.found; });
       var anyFound = results.some(function(r) { return r.found; });
+      var anyHardFail = results.some(function(r) { return !r.found && !r.inaccessible; });
 
       if (allFound) {
         resultsDiv.classList.remove('text-red-600', 'text-yellow-600');
+      } else if (!anyHardFail) {
+        resultsDiv.classList.remove('text-red-600');
+        resultsDiv.classList.add('text-yellow-600');
       } else if (anyFound) {
         resultsDiv.classList.remove('text-red-600');
         resultsDiv.classList.add('text-yellow-600');
