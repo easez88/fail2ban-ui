@@ -338,6 +338,11 @@ semodule -i fail2ban-container-ui.pp
 semodule -i fail2ban-container-client.pp
 ```
 
+What the modules cover:
+
+- `fail2ban-container-ui`: lets the container write the managed files under `/etc/fail2ban` and stat/read `/var/log/fail2ban.log`. The latter is required as soon as a jail uses Fail2Ban's own log as `logpath` (e.g. the `recidive` jail): `fail2ban-client reload` stats every logpath while parsing the config, and a denial surfaces as `Have not found any log file for recidive jail`.
+- `fail2ban-container-client`: lets the container connect to the host Fail2Ban socket and read the monitored logs (`httpd_log_t`, `var_log_t`).
+
 ### Compile and install the policies manually
 
 To modify or rebuild the SELinux rules:
