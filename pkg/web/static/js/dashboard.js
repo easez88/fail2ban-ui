@@ -22,23 +22,24 @@ function refreshData(options) {
     showLoading(true);
   }
 
-  // Slower sections load independently and don't hold up the page.
-  banEventsLoading = true;
-  Promise.all([
-    fetchBanStatisticsData(),
-    fetchBanEventsData(),
-    fetchBanInsightsData(),
-    fetchBanEventCountries()
-  ])
-    .catch(function(err) {
-      console.error('Error loading ban events/insights:', err);
-    })
-    .finally(function() {
-      banEventsLoading = false;
-      renderDashboard();
-    });
+  if (!options.summaryOnly) {
+    banEventsLoading = true;
+    Promise.all([
+      fetchBanStatisticsData(),
+      fetchBanEventsData(),
+      fetchBanInsightsData(),
+      fetchBanEventCountries()
+    ])
+      .catch(function(err) {
+        console.error('Error loading ban events/insights:', err);
+      })
+      .finally(function() {
+        banEventsLoading = false;
+        renderDashboard();
+      });
+  }
 
-  return Promise.all([
+  return Promise.all(options.summaryOnly ? [summaryPromise] : [
     summaryPromise,
     fetchThreatIntelProviderData()
   ])
