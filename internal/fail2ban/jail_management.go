@@ -366,55 +366,11 @@ func GetAllJails(configPath string) ([]JailInfo, error) {
 }
 
 func parseJailConfigFile(path string) ([]JailInfo, error) {
-	var jails []JailInfo
-	file, err := os.Open(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	var currentJail string
-
-	ignoredSections := map[string]bool{
-		"DEFAULT":  true,
-		"INCLUDES": true,
-	}
-
-	enabled := true
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			if currentJail != "" && !ignoredSections[currentJail] {
-				jails = append(jails, JailInfo{
-					JailName: currentJail,
-					Enabled:  enabled,
-				})
-			}
-			currentJail = strings.TrimSpace(strings.Trim(line, "[]"))
-			if currentJail == "" {
-				currentJail = ""
-				enabled = true
-				continue
-			}
-			enabled = true
-		} else if strings.HasPrefix(strings.ToLower(line), "enabled") {
-			if currentJail != "" {
-				parts := strings.Split(line, "=")
-				if len(parts) == 2 {
-					value := strings.TrimSpace(parts[1])
-					enabled = strings.EqualFold(value, "true")
-				}
-			}
-		}
-	}
-	if currentJail != "" && !ignoredSections[currentJail] {
-		jails = append(jails, JailInfo{
-			JailName: currentJail,
-			Enabled:  enabled,
-		})
-	}
-	return jails, scanner.Err()
+	return parseJailConfigContent(string(content)), nil
 }
 
 // =========================================================================

@@ -1056,32 +1056,6 @@ WHERE 1=1`
 	return result, rows.Err()
 }
 
-// Returns total number of ban events optionally filtered by time and server.
-func CountBanEvents(ctx context.Context, since time.Time, serverID string) (int64, error) {
-	if db == nil {
-		return 0, errors.New("storage not initialised")
-	}
-
-	query := `
-SELECT COUNT(*)
-FROM ban_events
-WHERE 1=1`
-	args := []any{}
-
-	if serverID != "" {
-		query += " AND server_id = ?"
-		args = append(args, serverID)
-	}
-
-	addOccurredAtSinceFilter(&query, &args, since)
-
-	var total int64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
-		return 0, err
-	}
-	return total, nil
-}
-
 // Returns per-jail ban-event counts for one server since the provided timestamp, in a single query.
 func CountRecentBanEventsByJail(ctx context.Context, serverID string, since time.Time) (map[string]int, error) {
 	if db == nil {
