@@ -760,5 +760,6 @@
   "logs.timeline.series_unbans": "Entsperrungen",
   "logs.timeline.suggestions_empty": "Keine ähnlichen Zeiträume gefunden.",
   "logs.timeline.suggestions_title": "Ähnliche frühere Zeiträume",
-  "logs.timeline.title": "Ban- & Unban-Aktivität"
+  "logs.timeline.title": "Ban- & Unban-Aktivität",
+  "jails.manage.offender_disabled": "Ihre Änderung wurde übernommen. Das nicht betroffene Jail '{jail}' hat eine fehlerhafte Konfiguration und wurde automatisch deaktiviert."
 }

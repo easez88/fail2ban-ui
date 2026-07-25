@@ -209,7 +209,13 @@ function saveManageJailsSingle(checkbox) {
       }
 
       console.log('Jail state saved successfully:', data);
-      showToast(data.message || t(isEnabled ? 'jails.toast.enabled_success' : 'jails.toast.disabled_success', 'Jail {jail} ' + (isEnabled ? 'enabled' : 'disabled') + ' successfully').replace('{jail}', jailName), 'success');
+      if (data.disabledJails && Array.isArray(data.disabledJails) && data.disabledJails.length) {
+        var offenderMsg = t('jails.manage.offender_disabled', "Your change was applied. Unrelated jail '{jail}' has a broken configuration and was automatically disabled.")
+          .replace('{jail}', data.disabledJails.join("', '"));
+        showToast(offenderMsg, 'warning', 15000);
+      } else {
+        showToast(data.message || t(isEnabled ? 'jails.toast.enabled_success' : 'jails.toast.disabled_success', 'Jail {jail} ' + (isEnabled ? 'enabled' : 'disabled') + ' successfully').replace('{jail}', jailName), 'success');
+      }
       return fetch(withServerParam('/api/jails/manage'), {
         headers: serverHeaders()
       }).then(function(res) { return res.json(); })

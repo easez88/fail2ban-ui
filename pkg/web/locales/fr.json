@@ -760,5 +760,6 @@
   "logs.timeline.series_unbans": "Débannissements",
   "logs.timeline.suggestions_empty": "Aucune période similaire trouvée.",
   "logs.timeline.suggestions_title": "Périodes passées similaires",
-  "logs.timeline.title": "Activité de bannissement et débannissement"
+  "logs.timeline.title": "Activité de bannissement et débannissement",
+  "jails.manage.offender_disabled": "Votre modification a été appliquée. Le jail non concerné '{jail}' a une configuration défectueuse et a été désactivé automatiquement."
 }

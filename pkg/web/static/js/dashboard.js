@@ -1225,7 +1225,25 @@ function updateBanEventFromWebSocket(event) {
   }
 }
 
+var JAIL_LIST_REFRESH_MIN_INTERVAL_MS = 3000;
+var jailListLastRefreshAt = {};
+
+function refreshJailBannedListLive(jailName) {
+  if (!jailName || typeof fetchJailBannedIPs !== 'function') {
+    return;
+  }
+  var now = Date.now();
+  if (jailListLastRefreshAt[jailName] && now - jailListLastRefreshAt[jailName] < JAIL_LIST_REFRESH_MIN_INTERVAL_MS) {
+    return;
+  }
+  jailListLastRefreshAt[jailName] = now;
+  fetchJailBannedIPs(jailName, { append: false });
+}
+
 function addBanEventFromWebSocket(event) {
+  if (event && event.jail) {
+    refreshJailBannedListLive(event.jail);
+  }
   // Server-filtered view must not receive live rows from other servers.
   if (banEventsFilterServer !== 'all' && event && event.serverId !== banEventsFilterServer) {
     if (typeof showBanEventToast === 'function') {

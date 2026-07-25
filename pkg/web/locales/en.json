@@ -760,5 +760,6 @@
   "logs.timeline.series_unbans": "Unbans",
   "logs.timeline.suggestions_empty": "No similar periods found.",
   "logs.timeline.suggestions_title": "Similar past periods",
-  "logs.timeline.title": "Ban & unban activity"
+  "logs.timeline.title": "Ban & unban activity",
+  "jails.manage.offender_disabled": "Your change was applied. Unrelated jail '{jail}' has a broken configuration and was automatically disabled."
 }

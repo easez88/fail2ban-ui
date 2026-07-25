@@ -185,9 +185,12 @@ func DiscoverJailsFromFiles(configPath string) ([]JailInfo, error) {
 
 	var allJails []JailInfo
 	processedFiles := make(map[string]bool)
+	jailIndex := make(map[string]int)
 	processedJails := make(map[string]bool)
 
-	// Parse .local files
+	// Parse .local files (sorted)
+	// Fail2ban reads jail.d lexically with last-wins semantics, so a jail defined in several .local files takes its
+	// state from the LAST file -> mirror that here or the UI would show a state the daemon does not have.
 	for _, filePath := range files {
 		if !strings.HasSuffix(filePath, ".local") {
 			continue
@@ -210,7 +213,13 @@ func DiscoverJailsFromFiles(configPath string) ([]JailInfo, error) {
 		}
 
 		for _, jail := range jails {
-			if jail.JailName != "" && jail.JailName != "DEFAULT" && !processedJails[jail.JailName] {
+			if jail.JailName == "" || jail.JailName == "DEFAULT" {
+				continue
+			}
+			if idx, seen := jailIndex[jail.JailName]; seen {
+				allJails[idx].Enabled = jail.Enabled
+			} else {
+				jailIndex[jail.JailName] = len(allJails)
 				allJails = append(allJails, jail)
 				processedJails[jail.JailName] = true
 			}
@@ -424,73 +433,127 @@ func UpdateJailEnabledStates(updates map[string]bool, configPath string) error {
 		}
 		debugf("Processing jail: %s, enabled: %t", jailName, enabled)
 
-		if err := ensureJailLocalFile(jailName, configPath); err != nil {
-			return fmt.Errorf("failed to ensure .local file for jail %s: %w", jailName, err)
-		}
-		jailFilePath, err := resolveWithinDir(jailDPath, jailName, ".local")
+		definingFiles, err := jailFilesDefining(jailName, jailDPath)
 		if err != nil {
 			return err
 		}
-		debugf("Jail file path: %s", jailFilePath)
-		content, err := os.ReadFile(jailFilePath)
-		if err != nil {
-			return fmt.Errorf("failed to read jail .local file %s: %w", jailFilePath, err)
-		}
-		var lines []string
-		if len(content) > 0 {
-			lines = strings.Split(string(content), "\n")
-		} else {
-			lines = []string{fmt.Sprintf("[%s]", jailName)}
-		}
-		var outputLines []string
-		var foundEnabled bool
-		var currentJail string
-
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-				currentJail = strings.Trim(trimmed, "[]")
-				outputLines = append(outputLines, line)
-			} else if strings.HasPrefix(strings.ToLower(trimmed), "enabled") {
-				if currentJail == jailName {
-					outputLines = append(outputLines, fmt.Sprintf("enabled = %t", enabled))
-					foundEnabled = true
-				} else {
-					outputLines = append(outputLines, line)
-				}
-			} else {
-				outputLines = append(outputLines, line)
+		if len(definingFiles) == 0 {
+			if err := ensureJailLocalFile(jailName, configPath); err != nil {
+				return fmt.Errorf("failed to ensure .local file for jail %s: %w", jailName, err)
 			}
-		}
-		if !foundEnabled {
-			var newLines []string
-			for i, line := range outputLines {
-				newLines = append(newLines, line)
-				if strings.TrimSpace(line) == fmt.Sprintf("[%s]", jailName) {
-					// Insert enabled line after the section header
-					newLines = append(newLines, fmt.Sprintf("enabled = %t", enabled))
-					if i+1 < len(outputLines) {
-						newLines = append(newLines, outputLines[i+1:]...)
-					}
-					break
-				}
+			jailFilePath, err := resolveWithinDir(jailDPath, jailName, ".local")
+			if err != nil {
+				return err
 			}
-			if len(newLines) > len(outputLines) {
-				outputLines = newLines
-			} else {
-				outputLines = append(outputLines, fmt.Sprintf("enabled = %t", enabled))
+			definingFiles = []string{jailFilePath}
+		}
+		for _, jailFilePath := range definingFiles {
+			if err := setJailEnabledInFile(jailFilePath, jailName, enabled); err != nil {
+				return err
 			}
+			debugf("Updated jail %s: enabled = %t (file: %s)", jailName, enabled, jailFilePath)
 		}
-		newContent := strings.Join(outputLines, "\n")
-		if !strings.HasSuffix(newContent, "\n") {
-			newContent += "\n"
-		}
-		if err := os.WriteFile(jailFilePath, []byte(newContent), 0644); err != nil {
-			return fmt.Errorf("failed to write jail file %s: %w", jailFilePath, err)
-		}
-		debugf("Updated jail %s: enabled = %t (file: %s)", jailName, enabled, jailFilePath)
 	}
 	return nil
+}
+
+// Returns all jail.d/*.local files (sorted) containing a [jailName] section
+func jailFilesDefining(jailName, jailDPath string) ([]string, error) {
+	entries, err := os.ReadDir(jailDPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read jail.d directory %s: %w", jailDPath, err)
+	}
+	sectionHeader := fmt.Sprintf("[%s]", jailName)
+	var files []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".local") {
+			continue
+		}
+		path := filepath.Join(jailDPath, entry.Name())
+		content, err := os.ReadFile(path)
+		if err != nil {
+			debugf("Skipping unreadable jail file %s: %v", path, err)
+			continue
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			if strings.TrimSpace(line) == sectionHeader {
+				files = append(files, path)
+				break
+			}
+		}
+	}
+	return files, nil
+}
+
+// Rewrites (or inserts) the enabled line of the [jailName] section in one file
+func setJailEnabledInFile(jailFilePath, jailName string, enabled bool) error {
+	content, err := os.ReadFile(jailFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to read jail .local file %s: %w", jailFilePath, err)
+	}
+	newContent := rewriteJailEnabled(string(content), jailName, enabled)
+	if err := os.WriteFile(jailFilePath, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("failed to write jail file %s: %w", jailFilePath, err)
+	}
+	return nil
+}
+
+// Rewrites (or inserts) the enabled line of the [jailName] section in the given file content
+// Shared by the local and SSH connectors
+func rewriteJailEnabled(content, jailName string, enabled bool) string {
+	var lines []string
+	if len(content) > 0 {
+		lines = strings.Split(content, "\n")
+	} else {
+		lines = []string{fmt.Sprintf("[%s]", jailName)}
+	}
+	var outputLines []string
+	var foundEnabled bool
+	var currentJail string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			currentJail = strings.Trim(trimmed, "[]")
+			outputLines = append(outputLines, line)
+		} else if strings.HasPrefix(strings.ToLower(trimmed), "enabled") {
+			if currentJail == jailName {
+				outputLines = append(outputLines, fmt.Sprintf("enabled = %t", enabled))
+				foundEnabled = true
+			} else {
+				outputLines = append(outputLines, line)
+			}
+		} else {
+			outputLines = append(outputLines, line)
+		}
+	}
+	if !foundEnabled {
+		var newLines []string
+		for i, line := range outputLines {
+			newLines = append(newLines, line)
+			if strings.TrimSpace(line) == fmt.Sprintf("[%s]", jailName) {
+				// Insert enabled line after the section header
+				newLines = append(newLines, fmt.Sprintf("enabled = %t", enabled))
+				if i+1 < len(outputLines) {
+					newLines = append(newLines, outputLines[i+1:]...)
+				}
+				break
+			}
+		}
+		if len(newLines) > len(outputLines) {
+			outputLines = newLines
+		} else {
+			outputLines = append(outputLines, fmt.Sprintf("enabled = %t", enabled))
+		}
+	}
+	newContent := strings.Join(outputLines, "\n")
+	if !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	return newContent
 }
 
 // Returns the full jail configuration from /etc/fail2ban/jail.d/{jailName}.local

@@ -359,7 +359,7 @@ func removeDuplicateVariables(includedContent string, mainVariables map[string]b
 			continue
 		}
 
-		// Check for end of [DEFAULT] section (next section starts)
+		// Check for end of [DEFAULT] section
 		if inDefaultSection && strings.HasPrefix(trimmed, "[") {
 			inDefaultSection = false
 			result.WriteString(originalLine)

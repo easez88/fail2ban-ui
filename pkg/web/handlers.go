@@ -1566,7 +1566,18 @@ func HandleBanNotification(ctx context.Context, server config.Fail2banServer, ip
 // Records an unban event, broadcasts it via WebSocket, and sends an email alert if enabled.
 func HandleUnbanNotification(ctx context.Context, server config.Fail2banServer, ip, jail, hostname, whois, country string) error {
 	settings := config.GetSettings()
-	country = resolveCountry(ip, country, settings)
+	if country == "" || whois == "" {
+		if storedCountry, storedWhois, err := storage.LatestBanEnrichmentForIP(ctx, ip); err == nil {
+			if country == "" {
+				country = storedCountry
+			}
+			if whois == "" {
+				whois = storedWhois
+			}
+		} else {
+			log.Printf("WARNING: failed to look up stored enrichment for IP %s: %v", ip, err)
+		}
+	}
 	event := storage.BanEventRecord{
 		ServerID:   server.ID,
 		ServerName: server.Name,
@@ -2810,15 +2821,6 @@ func getJailNames(jails map[string]bool) []string {
 	return names
 }
 
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
 func splitLogpaths(raw string) []string {
 	var out []string
 	for line := range strings.SplitSeq(raw, "\n") {
@@ -2832,17 +2834,19 @@ func splitLogpaths(raw string) []string {
 	return out
 }
 
-var jailErrorPattern = regexp.MustCompile(`Errors in jail '([^']+)'`)
+var jailErrorPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`Errors in jail '([^']+)'`),
+	regexp.MustCompile(`Have not found any log file for (\S+) jail`),
+}
 
 func parseJailErrorsFromReloadOutput(output string) []string {
 	var problematicJails []string
-	lines := strings.Split(output, "\n")
-
-	for _, line := range lines {
-		if strings.Contains(line, "Errors in jail") && strings.Contains(line, "Skipping") {
-			matches := jailErrorPattern.FindStringSubmatch(line)
-			if len(matches) > 1 {
-				problematicJails = append(problematicJails, matches[1])
+	for _, line := range strings.Split(output, "\n") {
+		for _, pattern := range jailErrorPatterns {
+			for _, matches := range pattern.FindAllStringSubmatch(line, -1) {
+				if len(matches) > 1 {
+					problematicJails = append(problematicJails, matches[1])
+				}
 			}
 		}
 	}
@@ -2982,7 +2986,10 @@ func UpdateJailManagementHandler(c *gin.Context) {
 			}
 		}
 
-		// If problematic jails are found, disables them // TODO: @matthias we need to further enhance this
+		if detailedErrorOutput != "" {
+			errMsg = strings.TrimSpace(detailedErrorOutput)
+		}
+
 		if len(problematicJails) > 0 {
 			config.DebugLog("Found %d problematic jail(s) in reload output: %v", len(problematicJails), problematicJails)
 
@@ -2991,30 +2998,35 @@ func UpdateJailManagementHandler(c *gin.Context) {
 				disableUpdate[jailName] = false
 			}
 
-			for jailName := range enabledJails {
-				if contains(problematicJails, jailName) {
-					disableUpdate[jailName] = false
-				}
-			}
-
-			if len(disableUpdate) > 0 {
-				if disableErr := conn.UpdateJailEnabledStates(c.Request.Context(), disableUpdate); disableErr != nil {
-					config.DebugLog("Error disabling problematic jails: %v", disableErr)
-				} else {
-					// Reload again after disabling
-					if reloadErr2 := conn.Reload(c.Request.Context()); reloadErr2 != nil {
-						config.DebugLog("Error: failed to reload fail2ban after disabling problematic jails: %v", reloadErr2)
+			if disableErr := conn.UpdateJailEnabledStates(c.Request.Context(), disableUpdate); disableErr != nil {
+				config.DebugLog("Error disabling problematic jails: %v", disableErr)
+			} else if reloadErr2 := conn.Reload(c.Request.Context()); reloadErr2 != nil {
+				config.DebugLog("Error: failed to reload fail2ban after disabling problematic jails: %v", reloadErr2)
+			} else {
+				// Recovered by disabling the offenders only
+				var revertedToggled []string
+				for _, jailName := range problematicJails {
+					if enabledJails[jailName] {
+						revertedToggled = append(revertedToggled, jailName)
 					}
 				}
+				if len(revertedToggled) > 0 {
+					c.JSON(http.StatusOK, gin.H{
+						"error":         fmt.Sprintf("Jail '%s' was enabled but caused a reload error: %s. It has been automatically disabled.", strings.Join(revertedToggled, "', '"), errMsg),
+						"autoDisabled":  true,
+						"enabledJails":  revertedToggled,
+						"disabledJails": problematicJails,
+					})
+					return
+				}
+				config.DebugLog("Disabled unrelated broken jail(s) %v; requested change kept", problematicJails)
+				c.JSON(http.StatusOK, gin.H{
+					"message":       fmt.Sprintf("Your change was applied. Unrelated jail '%s' has a broken configuration and was automatically disabled (%s).", strings.Join(problematicJails, "', '"), errMsg),
+					"messageKey":    "jails.manage.offender_disabled",
+					"disabledJails": problematicJails,
+				})
+				return
 			}
-
-			for _, jailName := range problematicJails {
-				enabledJails[jailName] = true
-			}
-		}
-
-		if detailedErrorOutput != "" {
-			errMsg = strings.TrimSpace(detailedErrorOutput)
 		}
 
 		if len(enabledJails) > 0 {

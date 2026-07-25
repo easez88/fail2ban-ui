@@ -742,7 +742,26 @@ func (sc *SSHConnector) GetAllJails(ctx context.Context) ([]JailInfo, error) {
 	jailDPath := filepath.Join(fail2banPath, "jail.d")
 
 	var allJails []JailInfo
-	processedJails := make(map[string]bool)
+	jailIndex := make(map[string]int)
+	jailSource := make(map[string]string)
+
+	addJails := func(content, fileType string) {
+		for _, jail := range parseJailConfigContent(content) {
+			if jail.JailName == "" || jail.JailName == "DEFAULT" {
+				continue
+			}
+			idx, seen := jailIndex[jail.JailName]
+			switch {
+			case !seen:
+				jailIndex[jail.JailName] = len(allJails)
+				jailSource[jail.JailName] = fileType
+				allJails = append(allJails, jail)
+			case fileType == "local" || jailSource[jail.JailName] == fileType:
+				allJails[idx].Enabled = jail.Enabled
+				jailSource[jail.JailName] = fileType
+			}
+		}
+	}
 
 	readAllScript := fmt.Sprintf(`python3 << 'PYEOF'
 import os
@@ -804,7 +823,7 @@ PYEOF`, jailDPath)
 		debugf("Failed to read all jail files at once on server %s, falling back to individual reads: %v", sc.server.Name, err)
 		return sc.getAllJailsFallback(ctx, jailDPath)
 	}
-	var currentFile string
+	var currentFile, currentType string
 	var currentContent strings.Builder
 	inFile := false
 
@@ -812,34 +831,22 @@ PYEOF`, jailDPath)
 	for _, line := range lines {
 		if strings.HasPrefix(line, "FILE_START:") {
 			if inFile && currentFile != "" {
-				content := currentContent.String()
-				jails := parseJailConfigContent(content)
-				for _, jail := range jails {
-					if jail.JailName != "" && jail.JailName != "DEFAULT" && !processedJails[jail.JailName] {
-						allJails = append(allJails, jail)
-						processedJails[jail.JailName] = true
-					}
-				}
+				addJails(currentContent.String(), currentType)
 			}
 			parts := strings.SplitN(line, ":", 3)
 			if len(parts) == 3 {
 				currentFile = parts[1]
+				currentType = parts[2]
 				currentContent.Reset()
 				inFile = true
 			}
 		} else if line == "FILE_END" {
 			if inFile && currentFile != "" {
-				content := currentContent.String()
-				jails := parseJailConfigContent(content)
-				for _, jail := range jails {
-					if jail.JailName != "" && jail.JailName != "DEFAULT" && !processedJails[jail.JailName] {
-						allJails = append(allJails, jail)
-						processedJails[jail.JailName] = true
-					}
-				}
+				addJails(currentContent.String(), currentType)
 			}
 			inFile = false
 			currentFile = ""
+			currentType = ""
 			currentContent.Reset()
 		} else if inFile {
 			if currentContent.Len() > 0 {
@@ -850,14 +857,7 @@ PYEOF`, jailDPath)
 	}
 
 	if inFile && currentFile != "" {
-		content := currentContent.String()
-		jails := parseJailConfigContent(content)
-		for _, jail := range jails {
-			if jail.JailName != "" && jail.JailName != "DEFAULT" && !processedJails[jail.JailName] {
-				allJails = append(allJails, jail)
-				processedJails[jail.JailName] = true
-			}
-		}
+		addJails(currentContent.String(), currentType)
 	}
 
 	return allJails, nil
@@ -866,12 +866,28 @@ PYEOF`, jailDPath)
 func (sc *SSHConnector) getAllJailsFallback(ctx context.Context, jailDPath string) ([]JailInfo, error) {
 	var allJails []JailInfo
 	processedFiles := make(map[string]bool)
-	processedJails := make(map[string]bool)
+	jailIndex := make(map[string]int)
+	addJails := func(content string, isLocal bool) {
+		for _, jail := range parseJailConfigContent(content) {
+			if jail.JailName == "" || jail.JailName == "DEFAULT" {
+				continue
+			}
+			idx, seen := jailIndex[jail.JailName]
+			switch {
+			case !seen:
+				jailIndex[jail.JailName] = len(allJails)
+				allJails = append(allJails, jail)
+			case isLocal:
+				allJails[idx].Enabled = jail.Enabled
+			}
+		}
+	}
 
 	localFiles, err := sc.listRemoteFiles(ctx, jailDPath, ".local")
 	if err != nil {
 		debugf("Failed to list .local files in jail.d on server %s: %v", sc.server.Name, err)
 	} else {
+		sort.Strings(localFiles)
 		for _, filePath := range localFiles {
 			filename := filepath.Base(filePath)
 			baseName := strings.TrimSuffix(filename, ".local")
@@ -885,14 +901,7 @@ func (sc *SSHConnector) getAllJailsFallback(ctx context.Context, jailDPath strin
 				debugf("Failed to read jail file %s on server %s: %v", filePath, sc.server.Name, err)
 				continue
 			}
-
-			jails := parseJailConfigContent(content)
-			for _, jail := range jails {
-				if jail.JailName != "" && jail.JailName != "DEFAULT" && !processedJails[jail.JailName] {
-					allJails = append(allJails, jail)
-					processedJails[jail.JailName] = true
-				}
-			}
+			addJails(content, true)
 		}
 	}
 
@@ -900,6 +909,7 @@ func (sc *SSHConnector) getAllJailsFallback(ctx context.Context, jailDPath strin
 	if err != nil {
 		debugf("Failed to list .conf files in jail.d on server %s: %v", sc.server.Name, err)
 	} else {
+		sort.Strings(confFiles)
 		for _, filePath := range confFiles {
 			filename := filepath.Base(filePath)
 			baseName := strings.TrimSuffix(filename, ".conf")
@@ -913,14 +923,7 @@ func (sc *SSHConnector) getAllJailsFallback(ctx context.Context, jailDPath strin
 				debugf("Failed to read jail file %s on server %s: %v", filePath, sc.server.Name, err)
 				continue
 			}
-
-			jails := parseJailConfigContent(content)
-			for _, jail := range jails {
-				if jail.JailName != "" && jail.JailName != "DEFAULT" && !processedJails[jail.JailName] {
-					allJails = append(allJails, jail)
-					processedJails[jail.JailName] = true
-				}
-			}
+			addJails(content, false)
 		}
 	}
 	return allJails, nil
@@ -930,78 +933,51 @@ func (sc *SSHConnector) UpdateJailEnabledStates(ctx context.Context, updates map
 	fail2banPath := sc.getFail2banPath(ctx)
 	jailDPath := filepath.Join(fail2banPath, "jail.d")
 
-	// Update each jail in its own .local file
 	for jailName, enabled := range updates {
 		jailName = strings.TrimSpace(jailName)
 		if jailName == "" {
 			debugf("Skipping empty jail name in updates map")
 			continue
 		}
+		if err := ValidateJailName(jailName); err != nil {
+			return fmt.Errorf("invalid jail name in updates map: %w", err)
+		}
 
 		localPath := filepath.Join(jailDPath, jailName+".local")
 		confPath := filepath.Join(jailDPath, jailName+".conf")
-
-		combinedScript := fmt.Sprintf(`
-			if [ ! -f "%s" ]; then
+		findScript := fmt.Sprintf(`
+			files=$(grep -lxF '[%s]' %s/*.local 2>/dev/null || true)
+			if [ -z "$files" ]; then
 				if [ -f "%s" ]; then
 					cp "%s" "%s"
 				else
 					echo "[%s]" > "%s"
 				fi
+				files="%s"
 			fi
-			cat "%s"
-		`, localPath, confPath, confPath, localPath, jailName, localPath, localPath)
+			echo "$files"
+		`, jailName, jailDPath, confPath, confPath, localPath, jailName, localPath, localPath)
 
-		content, err := sc.runRemoteCommand(ctx, []string{combinedScript})
+		fileList, err := sc.runRemoteCommand(ctx, []string{findScript})
 		if err != nil {
-			return fmt.Errorf("failed to ensure and read .local file for jail %s: %w", jailName, err)
+			return fmt.Errorf("failed to locate .local files for jail %s: %w", jailName, err)
 		}
 
-		lines := strings.Split(content, "\n")
-		var outputLines []string
-		var foundEnabled bool
-		var currentJail string
-
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-				currentJail = strings.Trim(trimmed, "[]")
-				outputLines = append(outputLines, line)
-			} else if strings.HasPrefix(strings.ToLower(trimmed), "enabled") {
-				if currentJail == jailName {
-					outputLines = append(outputLines, fmt.Sprintf("enabled = %t", enabled))
-					foundEnabled = true
-				} else {
-					outputLines = append(outputLines, line)
-				}
-			} else {
-				outputLines = append(outputLines, line)
+		for _, jailFilePath := range strings.Fields(fileList) {
+			if !strings.HasPrefix(jailFilePath, jailDPath+"/") || !strings.HasSuffix(jailFilePath, ".local") {
+				debugf("Skipping unexpected jail file path from remote: %s", jailFilePath)
+				continue
 			}
-		}
-
-		if !foundEnabled {
-			var newLines []string
-			for i, line := range outputLines {
-				newLines = append(newLines, line)
-				if strings.TrimSpace(line) == fmt.Sprintf("[%s]", jailName) {
-					newLines = append(newLines, fmt.Sprintf("enabled = %t", enabled))
-					if i+1 < len(outputLines) {
-						newLines = append(newLines, outputLines[i+1:]...)
-					}
-					break
-				}
+			content, err := sc.runRemoteCommand(ctx, []string{fmt.Sprintf("cat %q", jailFilePath)})
+			if err != nil {
+				return fmt.Errorf("failed to read jail .local file %s: %w", jailFilePath, err)
 			}
-			if len(newLines) > len(outputLines) {
-				outputLines = newLines
-			} else {
-				outputLines = append(outputLines, fmt.Sprintf("enabled = %t", enabled))
+			newContent := rewriteJailEnabled(content, jailName, enabled)
+			cmd := fmt.Sprintf("cat <<'EOF' | tee %s >/dev/null\n%s\nEOF", jailFilePath, strings.TrimSuffix(newContent, "\n"))
+			if _, err := sc.runRemoteCommand(ctx, []string{cmd}); err != nil {
+				return fmt.Errorf("failed to write jail .local file %s: %w", jailFilePath, err)
 			}
-		}
-
-		newContent := strings.Join(outputLines, "\n")
-		cmd := fmt.Sprintf("cat <<'EOF' | tee %s >/dev/null\n%s\nEOF", localPath, newContent)
-		if _, err := sc.runRemoteCommand(ctx, []string{cmd}); err != nil {
-			return fmt.Errorf("failed to write jail .local file %s: %w", localPath, err)
+			debugf("Updated jail %s: enabled = %t (file: %s)", jailName, enabled, jailFilePath)
 		}
 	}
 	return nil
