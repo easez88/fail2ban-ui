@@ -912,7 +912,31 @@ WHERE 1=1`
 	return results, rows.Err()
 }
 
-// GetBanEventByID returns a single ban event including the whois/logs fields.
+// Returns the country and whois of the most recent ban event for the IP that carries any enrichment
+func LatestBanEnrichmentForIP(ctx context.Context, ip string) (country, whois string, err error) {
+	if db == nil {
+		return "", "", errors.New("storage not initialised")
+	}
+
+	const query = `
+SELECT country, whois
+FROM ban_events
+WHERE ip = ? AND event_type = 'ban' AND (COALESCE(country, '') != '' OR COALESCE(whois, '') != '')
+ORDER BY occurred_at DESC, id DESC
+LIMIT 1`
+
+	var c, w sql.NullString
+	err = db.QueryRowContext(ctx, query, ip).Scan(&c, &w)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return stringFromNull(c), stringFromNull(w), nil
+}
+
+// Returns a single ban event including the whois/logs fields.
 func GetBanEventByID(ctx context.Context, id int64) (BanEventRecord, bool, error) {
 	if db == nil {
 		return BanEventRecord{}, false, errors.New("storage not initialised")
