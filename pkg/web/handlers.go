@@ -2525,6 +2525,18 @@ func TestLogpathHandler(c *gin.Context) {
 		}
 		_, resolvedPath, filesOnServer, err := conn.TestLogpathWithResolution(c.Request.Context(), logpathLine)
 		if err != nil {
+			if errors.Is(err, fail2ban.ErrLogpathInaccessible) {
+				allResults = append(allResults, map[string]interface{}{
+					"logpath":       logpathLine,
+					"resolved_path": resolvedPath,
+					"found":         false,
+					"inaccessible":  true,
+					"files":         []string{},
+					"error":         "",
+					"message":       "Cannot verify: the log directory is not readable by the connector's SSH user. fail2ban runs as root and will read it, so the jail can still be enabled.",
+				})
+				continue
+			}
 			allResults = append(allResults, map[string]interface{}{
 				"logpath":       logpathLine,
 				"resolved_path": resolvedPath,
@@ -2930,10 +2942,15 @@ func UpdateJailManagementHandler(c *gin.Context) {
 		}
 
 		foundAnyFiles := false
+		inaccessible := false
 		var checkErrors []string
 		for _, lp := range paths {
 			_, resolvedPath, filesOnServer, testErr := conn.TestLogpathWithResolution(c.Request.Context(), lp)
 			if testErr != nil {
+				if errors.Is(testErr, fail2ban.ErrLogpathInaccessible) {
+					inaccessible = true
+					continue
+				}
 				checkErrors = append(checkErrors, fmt.Sprintf("%s (%v)", lp, testErr))
 				continue
 			}
@@ -2948,10 +2965,15 @@ func UpdateJailManagementHandler(c *gin.Context) {
 		}
 
 		if !foundAnyFiles {
-			c.JSON(http.StatusOK, gin.H{
-				"error": fmt.Sprintf("Jail '%s' cannot be enabled because no matching log files were found for its logpath(s): %s", jailName, strings.Join(checkErrors, "; ")),
-			})
-			return
+			if inaccessible {
+				log.Printf("WARNING: cannot verify logpath(s) for jail %s on server %s (log directory not readable by the connector's user); enabling anyway and relying on fail2ban (root) to read them",
+					jailName, conn.Server().Name)
+			} else {
+				c.JSON(http.StatusOK, gin.H{
+					"error": fmt.Sprintf("Jail '%s' cannot be enabled because no matching log files were found for its logpath(s): %s", jailName, strings.Join(checkErrors, "; ")),
+				})
+				return
+			}
 		}
 	}
 

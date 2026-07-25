@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -53,6 +54,8 @@ type SSHConnector struct {
 	tunnelMu     sync.Mutex
 	tunnelWasUp  bool
 	closed       atomic.Bool
+	masterMu     sync.Mutex
+	sessionSem   chan struct{}
 }
 
 const sshEnsureActionScript = `python3 - <<'PY'
@@ -89,7 +92,10 @@ func NewSSHConnector(server shared.Fail2banServer) (Connector, error) {
 	if server.SSHUser == "" {
 		return nil, fmt.Errorf("sshUser is required for ssh connector")
 	}
-	conn := &SSHConnector{server: server}
+	conn := &SSHConnector{
+		server:     server,
+		sessionSem: make(chan struct{}, sshMaxConcurrentSessions),
+	}
 
 	if server.ReverseTunnelEnabled {
 		conn.tunnelPort = resolveTunnelPort(server)
@@ -139,8 +145,7 @@ func (sc *SSHConnector) Server() shared.Fail2banServer {
 	return sc.server
 }
 
-// Caps how many concurrent SSH sessions the per-jail status fan-out may open over a single multiplexed master connection. (Keeping this below sshd's default MaxSessions (10) avoids "Session open refused by peer").
-const sshFanoutConcurrency = 4
+const sshMaxConcurrentSessions = 4
 
 // Collects jail status for every active remote jail.
 func (sc *SSHConnector) GetJailInfos(ctx context.Context) ([]JailInfo, error) {
@@ -148,15 +153,27 @@ func (sc *SSHConnector) GetJailInfos(ctx context.Context) ([]JailInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	sc.warmControlMaster(ctx)
-	return collectJailInfosLimited(ctx, jails, sc.GetBannedIPs, sshFanoutConcurrency)
+	return collectJailInfosLimited(ctx, jails, sc.GetBannedIPs, sshMaxConcurrentSessions)
 }
 
-// Opens a single SSH session to warm up the ControlMaster socket so it is fully established before any concurrent commands run.
-func (sc *SSHConnector) warmControlMaster(ctx context.Context) {
-	if _, err := sc.runRemoteCommand(ctx, []string{"true"}); err != nil {
-		debugf("SSH control master warm-up failed for %s: %v", sc.server.Name, err)
+func (sc *SSHConnector) ensureMaster(ctx context.Context) {
+	sc.masterMu.Lock()
+	defer sc.masterMu.Unlock()
+	if sc.checkMaster(ctx) {
+		return
 	}
+	if _, err := os.Stat(sc.controlPath()); err == nil {
+		_ = os.Remove(sc.controlPath())
+	}
+	args := sc.buildSSHArgs([]string{"true"})
+	if _, _, err := sc.execSSH(ctx, args, nil); err != nil {
+		debugf("SSH control master establish failed for %s: %v", sc.server.Name, err)
+	}
+}
+
+func (sc *SSHConnector) checkMaster(ctx context.Context) bool {
+	check := exec.CommandContext(ctx, "ssh", "-O", "check", "-o", "ControlPath="+sc.controlPath(), sc.sshTarget())
+	return check.Run() == nil
 }
 
 // Verifies the SSH ControlMaster if the reverse tunnel is alive (ssh -O check) and re-establish when it is not.
@@ -169,8 +186,7 @@ func (sc *SSHConnector) CheckTunnelHealth(ctx context.Context) {
 	}
 	defer sc.tunnelMu.Unlock()
 
-	check := exec.CommandContext(ctx, "ssh", "-O", "check", "-o", "ControlPath="+sc.controlPath(), sc.sshTarget())
-	if err := check.Run(); err == nil {
+	if sc.checkMaster(ctx) {
 		if !sc.tunnelWasUp {
 			log.Printf("reverse tunnel for server %s is up (port %d)", sc.server.Name, sc.tunnelPort)
 		}
@@ -186,17 +202,16 @@ func (sc *SSHConnector) CheckTunnelHealth(ctx context.Context) {
 		return
 	}
 
-	sc.warmControlMaster(ctx)
+	sc.ensureMaster(ctx)
 	if sc.closed.Load() {
 		sc.exitControlMaster()
 		return
 	}
-	recheck := exec.CommandContext(ctx, "ssh", "-O", "check", "-o", "ControlPath="+sc.controlPath(), sc.sshTarget())
-	if err := recheck.Run(); err == nil {
+	if sc.checkMaster(ctx) {
 		log.Printf("reverse tunnel for server %s re-established (port %d)", sc.server.Name, sc.tunnelPort)
 		sc.tunnelWasUp = true
 	} else {
-		debugf("reverse tunnel for server %s still down after re-dial: %v", sc.server.Name, err)
+		debugf("reverse tunnel for server %s still down after re-dial", sc.server.Name)
 	}
 }
 
@@ -206,7 +221,9 @@ func (sc *SSHConnector) exitControlMaster() {
 	defer cancel()
 	// -O -> exit only talks to the local control socket.
 	cmd := exec.CommandContext(ctx, "ssh", "-O", "exit", "-o", "ControlPath="+sc.controlPath(), sc.sshTarget())
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	defer func() { _ = os.Remove(sc.controlPath()) }()
+	if err != nil {
 		msg := strings.ToLower(string(out))
 		if !strings.Contains(msg, "no such file") && !strings.Contains(msg, "control socket connect") {
 			debugf("failed to close SSH control master for %s: %v (%s)", sc.server.Name, err, strings.TrimSpace(string(out)))
@@ -381,52 +398,26 @@ func (sc *SSHConnector) ensureAction(ctx context.Context) error {
 	script := strings.ReplaceAll(sshEnsureActionScript, "__PAYLOAD__", payload)
 	scriptB64 := base64.StdEncoding.EncodeToString([]byte(script))
 	args := sc.buildSSHArgs([]string{"sh", "-s"})
-	cmd := exec.CommandContext(ctx, "ssh", args...)
 
-	// Set process group to ensure all child processes (including SSH control master) are killed when the context is cancelled.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-		Pgid:    0,
-	}
-
-	// Create a script that reads the base64 string from stdin and pipes it through base64 -d | bash.
+	// The remote shell reads the base64 payload from stdin and pipes it through base64 -d | bash.
 	scriptContent := fmt.Sprintf("cat <<'ENDBASE64' | base64 -d | bash\n%s\nENDBASE64\n", scriptB64)
-	cmd.Stdin = strings.NewReader(scriptContent)
 
 	debugf("SSH ensureAction command [%s]: ssh %s (with here-doc via stdin)", sc.server.Name, strings.Join(args, " "))
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start ssh command: %w", err)
+	sc.ensureMaster(ctx)
+	if err := sc.acquireSession(ctx); err != nil {
+		return err
 	}
+	defer sc.releaseSession()
 
-	// Monitor context cancellation and command completion
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	var err error
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		if cmd.Process != nil && cmd.Process.Pid > 0 {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-			time.Sleep(100 * time.Millisecond)
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			_, _ = cmd.Process.Wait()
-		}
+	stdout, stderr, execErr := sc.execSSH(ctx, args, strings.NewReader(scriptContent))
+	if execErr != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
-
-	combinedOutput := append(stdout.Bytes(), stderr.Bytes()...)
-	output := strings.TrimSpace(string(combinedOutput))
+	output, err := selectCommandOutput(stdout, stderr, execErr)
 	if err != nil {
-		debugf("Failed to ensure action file for server %s: %v (output: %s)", sc.server.Name, err, output)
-		return fmt.Errorf("failed to ensure action file on remote server %s: %w (remote output: %s)", sc.server.Name, err, output)
+		debugf("Failed to ensure action file for server %s: %v", sc.server.Name, err)
+		return fmt.Errorf("failed to ensure action file on remote server %s: %w", sc.server.Name, err)
 	}
 	if marker := extractMissingToolsWarning(output); marker != "" {
 		log.Printf("warning: managed host %s (%s) is missing required tool(s): %s - ban callbacks will arrive empty until installed",
@@ -515,20 +506,21 @@ func (sc *SSHConnector) buildFail2banArgs(args ...string) []string {
 	return append(base, args...)
 }
 
-func (sc *SSHConnector) runRemoteCommand(ctx context.Context, command []string) (string, error) {
-	args := sc.buildSSHArgs(command)
+func (sc *SSHConnector) execSSH(ctx context.Context, args []string, stdin io.Reader) (string, string, error) {
 	cmd := exec.Command("ssh", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 		Pgid:    0,
 	}
-	debugf("SSH command [%s]: ssh %s", sc.server.Name, strings.Join(args, " "))
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("failed to start ssh command: %w", err)
+		return "", "", fmt.Errorf("failed to start ssh command: %w", err)
 	}
 	done := make(chan error, 1)
 	go func() {
@@ -536,14 +528,7 @@ func (sc *SSHConnector) runRemoteCommand(ctx context.Context, command []string) 
 	}()
 	select {
 	case err := <-done:
-		combinedOutput := append(stdout.Bytes(), stderr.Bytes()...)
-		output := strings.TrimSpace(string(combinedOutput))
-		if err != nil {
-			debugf("SSH command error [%s]: %v | output: %s", sc.server.Name, err, output)
-			return output, fmt.Errorf("ssh command failed: %w (output: %s)", err, output)
-		}
-		debugf("SSH command output [%s]: %s", sc.server.Name, output)
-		return output, nil
+		return stdout.String(), stderr.String(), err
 	case <-ctx.Done():
 		if cmd.Process != nil && cmd.Process.Pid > 0 {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
@@ -551,8 +536,56 @@ func (sc *SSHConnector) runRemoteCommand(ctx context.Context, command []string) 
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			_, _ = cmd.Process.Wait()
 		}
-		return "", ctx.Err()
+		return "", "", ctx.Err()
 	}
+}
+
+func selectCommandOutput(stdout, stderr string, err error) (string, error) {
+	if err != nil {
+		combined := strings.TrimSpace(strings.TrimSpace(stdout) + "\n" + strings.TrimSpace(stderr))
+		return combined, fmt.Errorf("ssh command failed: %w (output: %s)", err, combined)
+	}
+	return strings.TrimSpace(stdout), nil
+}
+
+func (sc *SSHConnector) acquireSession(ctx context.Context) error {
+	if sc.sessionSem == nil {
+		return nil
+	}
+	select {
+	case sc.sessionSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (sc *SSHConnector) releaseSession() {
+	if sc.sessionSem != nil {
+		<-sc.sessionSem
+	}
+}
+
+func (sc *SSHConnector) runRemoteCommand(ctx context.Context, command []string) (string, error) {
+	sc.ensureMaster(ctx)
+	if err := sc.acquireSession(ctx); err != nil {
+		return "", err
+	}
+	defer sc.releaseSession()
+
+	args := sc.buildSSHArgs(command)
+	debugf("SSH command [%s]: ssh %s", sc.server.Name, strings.Join(args, " "))
+	stdout, stderr, execErr := sc.execSSH(ctx, args, nil)
+	output, err := selectCommandOutput(stdout, stderr, execErr)
+	if err != nil {
+		debugf("SSH command error [%s]: %v", sc.server.Name, err)
+		return output, err
+	}
+	if s := strings.TrimSpace(stderr); s != "" {
+		debugf("SSH stderr ignored [%s]: %s", sc.server.Name, s)
+	}
+	debugf("SSH command output [%s]: %s", sc.server.Name, output)
+	return output, nil
 }
 
 // Returns the callback URL to embed in this server's action file.
@@ -564,8 +597,24 @@ func (sc *SSHConnector) actionCallbackURL() string {
 	return mustProvider().CallbackURL()
 }
 
+func (sc *SSHConnector) sshControlDir() string {
+	var base string
+	if sc.server.SSHKeyPath != "" {
+		base = filepath.Join(filepath.Dir(sc.server.SSHKeyPath), "ctl")
+	} else if cache, err := os.UserCacheDir(); err == nil {
+		base = filepath.Join(cache, "fail2ban-ui", "ssh-ctl")
+	}
+	if base != "" {
+		if err := os.MkdirAll(base, 0o700); err == nil {
+			return base
+		}
+	}
+	return os.TempDir()
+}
+
 func (sc *SSHConnector) controlPath() string {
-	return fmt.Sprintf("/tmp/ssh_control_%s_%s", sc.server.ID, strings.ReplaceAll(sc.server.Host, ".", "_"))
+	name := fmt.Sprintf("ssh_control_%s_%s", sc.server.ID, strings.ReplaceAll(sc.server.Host, ".", "_"))
+	return filepath.Join(sc.sshControlDir(), name)
 }
 
 func (sc *SSHConnector) sshTarget() string {
@@ -583,14 +632,16 @@ func (sc *SSHConnector) buildSSHArgs(command []string) []string {
 		"-o", "ServerAliveCountMax=2",
 	)
 	if _, container := os.LookupEnv("CONTAINER"); container {
+		knownHosts := "/config/.ssh/known_hosts"
+		if sc.server.SSHKeyPath != "" {
+			knownHosts = filepath.Join(filepath.Dir(sc.server.SSHKeyPath), "known_hosts")
+		}
 		args = append(args,
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "UserKnownHostsFile="+knownHosts,
 			"-o", "LogLevel=ERROR",
 		)
 	}
-	// ControlPersist=0 keeps the master SSH process (and with it the reverse
-	// tunnel) alive indefinitely; without a tunnel it expires after 300s.
 	controlPersist := "ControlPersist=300"
 	if sc.tunnelPort > 0 {
 		controlPersist = "ControlPersist=0"
@@ -628,9 +679,7 @@ func (sc *SSHConnector) listRemoteFiles(ctx context.Context, directory, pattern 
 
 	out, err := sc.runRemoteCommand(ctx, []string{cmd})
 	if err != nil {
-		// If find fails (e.g., directory doesn't exist or permission denied), return empty list.
-		debugf("Find command failed for %s on server %s: %v, returning empty list", directory, sc.server.Name, err)
-		return []string{}, nil
+		return nil, fmt.Errorf("failed to list files in %s: %w", directory, err)
 	}
 
 	var files []string
@@ -652,24 +701,47 @@ func (sc *SSHConnector) listRemoteFiles(ctx context.Context, directory, pattern 
 	return files, nil
 }
 
+func quoteRemotePath(filePath string) (string, error) {
+	if strings.ContainsAny(filePath, "'\n") {
+		return "", fmt.Errorf("unsupported character in remote path %q", filePath)
+	}
+	return "'" + filePath + "'", nil
+}
+
 func (sc *SSHConnector) readRemoteFile(ctx context.Context, filePath string) (string, error) {
-	content, err := sc.runRemoteCommand(ctx, []string{"cat", filePath})
+	quoted, err := quoteRemotePath(filePath)
+	if err != nil {
+		return "", err
+	}
+	content, err := sc.runRemoteCommand(ctx, []string{"cat " + quoted})
 	if err != nil {
 		return "", fmt.Errorf("failed to read remote file %s: %w", filePath, err)
 	}
 	return content, nil
 }
 
-func (sc *SSHConnector) writeRemoteFile(ctx context.Context, filePath, content string) error {
-	escaped := strings.ReplaceAll(content, "'", "'\"'\"'")
+const remoteWriteDelimiter = "F2BUI_REMOTE_EOF"
 
-	script := fmt.Sprintf(`cat > '%s' <<'REMOTEEOF'
-%s
-REMOTEEOF
-`, filePath, escaped)
-
-	_, err := sc.runRemoteCommand(ctx, []string{script})
+func buildRemoteWriteScript(filePath, content string) (string, error) {
+	quoted, err := quoteRemotePath(filePath)
 	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == remoteWriteDelimiter {
+			return "", fmt.Errorf("content contains the heredoc delimiter %q", remoteWriteDelimiter)
+		}
+	}
+	body := strings.TrimSuffix(content, "\n")
+	return fmt.Sprintf("cat > %s <<'%s'\n%s\n%s\n", quoted, remoteWriteDelimiter, body, remoteWriteDelimiter), nil
+}
+
+func (sc *SSHConnector) writeRemoteFile(ctx context.Context, filePath, content string) error {
+	script, err := buildRemoteWriteScript(filePath, content)
+	if err != nil {
+		return fmt.Errorf("refusing to write remote file %s: %w", filePath, err)
+	}
+	if _, err := sc.runRemoteCommand(ctx, []string{script}); err != nil {
 		return fmt.Errorf("failed to write remote file %s: %w", filePath, err)
 	}
 	return nil
@@ -968,13 +1040,15 @@ func (sc *SSHConnector) UpdateJailEnabledStates(ctx context.Context, updates map
 				debugf("Skipping unexpected jail file path from remote: %s", jailFilePath)
 				continue
 			}
-			content, err := sc.runRemoteCommand(ctx, []string{fmt.Sprintf("cat %q", jailFilePath)})
+			content, err := sc.readRemoteFile(ctx, jailFilePath)
 			if err != nil {
 				return fmt.Errorf("failed to read jail .local file %s: %w", jailFilePath, err)
 			}
+			if !containsJailSection(content, jailName) {
+				return fmt.Errorf("refusing to rewrite %s: section [%s] not found in remote file content", jailFilePath, jailName)
+			}
 			newContent := rewriteJailEnabled(content, jailName, enabled)
-			cmd := fmt.Sprintf("cat <<'EOF' | tee %s >/dev/null\n%s\nEOF", jailFilePath, strings.TrimSuffix(newContent, "\n"))
-			if _, err := sc.runRemoteCommand(ctx, []string{cmd}); err != nil {
+			if err := sc.writeRemoteFile(ctx, jailFilePath, newContent); err != nil {
 				return fmt.Errorf("failed to write jail .local file %s: %w", jailFilePath, err)
 			}
 			debugf("Updated jail %s: enabled = %t (file: %s)", jailName, enabled, jailFilePath)
@@ -1347,6 +1421,30 @@ func (sc *SSHConnector) SetJailConfig(ctx context.Context, jail, content string)
 	return nil
 }
 
+const (
+	logpathMarkerNoAccess = "F2BUI_NOACCESS"
+	logpathMarkerNoDir    = "F2BUI_NODIR"
+)
+
+func parseLogpathProbe(out string) ([]string, error) {
+	var matches []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		switch line {
+		case logpathMarkerNoAccess:
+			return nil, ErrLogpathInaccessible
+		case logpathMarkerNoDir:
+			return []string{}, nil
+		default:
+			matches = append(matches, line)
+		}
+	}
+	return matches, nil
+}
+
 func (sc *SSHConnector) TestLogpath(ctx context.Context, logpath string) ([]string, error) {
 	if logpath == "" {
 		return []string{}, nil
@@ -1358,36 +1456,33 @@ func (sc *SSHConnector) TestLogpath(ctx context.Context, logpath string) ([]stri
 	var script string
 	if hasWildcard {
 		script = fmt.Sprintf(`
-set -e
 LOGPATH=%q
-# Use find for glob patterns
-find $(dirname "$LOGPATH") -maxdepth 1 -path "$LOGPATH" -type f 2>/dev/null | sort
-`, logpath)
+DIR=$(dirname "$LOGPATH")
+if [ ! -d "$DIR" ]; then echo %s; exit 0; fi
+if [ ! -r "$DIR" ] || [ ! -x "$DIR" ]; then echo %s; exit 0; fi
+find "$DIR" -maxdepth 1 -path "$LOGPATH" -type f 2>/dev/null | sort
+`, logpath, logpathMarkerNoDir, logpathMarkerNoAccess)
 	} else {
 		script = fmt.Sprintf(`
-set -e
 LOGPATH=%q
+if [ -f "$LOGPATH" ]; then echo "$LOGPATH"; exit 0; fi
 if [ -d "$LOGPATH" ]; then
+  if [ ! -r "$LOGPATH" ] || [ ! -x "$LOGPATH" ]; then echo %s; exit 0; fi
   find "$LOGPATH" -maxdepth 1 -type f 2>/dev/null | sort
-elif [ -f "$LOGPATH" ]; then
-  echo "$LOGPATH"
+  exit 0
 fi
-`, logpath)
+DIR=$(dirname "$LOGPATH")
+if [ -d "$DIR" ] && { [ ! -r "$DIR" ] || [ ! -x "$DIR" ]; }; then echo %s; exit 0; fi
+echo %s
+`, logpath, logpathMarkerNoAccess, logpathMarkerNoAccess, logpathMarkerNoDir)
 	}
 
 	out, err := sc.runRemoteCommand(ctx, []string{script})
 	if err != nil {
-		return []string{}, nil
+		return nil, ErrLogpathInaccessible
 	}
 
-	var matches []string
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			matches = append(matches, line)
-		}
-	}
-	return matches, nil
+	return parseLogpathProbe(out)
 }
 
 func (sc *SSHConnector) TestLogpathWithResolution(ctx context.Context, logpath string) (originalPath, resolvedPath string, files []string, err error) {
@@ -1395,6 +1490,15 @@ func (sc *SSHConnector) TestLogpathWithResolution(ctx context.Context, logpath s
 	if originalPath == "" {
 		return originalPath, "", []string{}, nil
 	}
+
+	if len(extractVariablesFromString(originalPath)) == 0 {
+		files, err = sc.TestLogpath(ctx, originalPath)
+		if err != nil {
+			return originalPath, originalPath, nil, fmt.Errorf("failed to test logpath: %w", err)
+		}
+		return originalPath, originalPath, files, nil
+	}
+
 	resolveScript := fmt.Sprintf(`python3 - <<'PYEOF'
 import os
 import re
@@ -1563,21 +1667,8 @@ func (sc *SSHConnector) EnsureJailLocalStructure(ctx context.Context) error {
 		}
 	}
 
-	// Build content using the shared helper.
 	content := mustProvider().BuildJailLocalContent()
-
-	// Escape single quotes for safe use in a single-quoted heredoc
-	escaped := strings.ReplaceAll(content, "'", "'\"'\"'")
-
-	// Write the rebuilt content via heredoc over SSH. The path is quoted so a
-	// resolved fail2ban root containing shell metacharacters cannot break out.
-	writeScript := fmt.Sprintf(`cat > '%s' <<'JAILLOCAL'
-%s
-JAILLOCAL
-`, jailLocalPath, escaped)
-
-	_, err := sc.runRemoteCommand(ctx, []string{writeScript})
-	return err
+	return sc.writeRemoteFile(ctx, jailLocalPath, content)
 }
 
 // Migrate jail.local to jail.d/*.local. EXPERIMENTAL, only when JAIL_AUTOMIGRATION=true.
@@ -1634,12 +1725,7 @@ func (sc *SSHConnector) MigrateJailsFromJailLocalRemote(ctx context.Context) err
 			continue
 		}
 
-		escapedContent := strings.ReplaceAll(jailContent, "'", "'\"'\"'")
-		writeScript := fmt.Sprintf(`cat > %s <<'JAILEOF'
-%s
-JAILEOF
-`, jailFilePath, escapedContent)
-		if _, err := sc.runRemoteCommand(ctx, []string{writeScript}); err != nil {
+		if err := sc.writeRemoteFile(ctx, jailFilePath, jailContent); err != nil {
 			return fmt.Errorf("failed to write jail file %s: %w", jailFilePath, err)
 		}
 		debugf("Migrated jail %s to %s on server %s", jailName, jailFilePath, sc.server.Name)
@@ -1647,12 +1733,7 @@ JAILEOF
 	}
 
 	if migratedCount > 0 {
-		escapedDefault := strings.ReplaceAll(defaultContent, "'", "'\"'\"'")
-		writeLocalScript := fmt.Sprintf(`cat > %s <<'LOCALEOF'
-%s
-LOCALEOF
-`, jailLocalPath, escapedDefault)
-		if _, err := sc.runRemoteCommand(ctx, []string{writeLocalScript}); err != nil {
+		if err := sc.writeRemoteFile(ctx, jailLocalPath, defaultContent); err != nil {
 			return fmt.Errorf("failed to rewrite jail.local: %w", err)
 		}
 		debugf("Migration completed on server %s: moved %d jails to jail.d/", sc.server.Name, migratedCount)

@@ -17,6 +17,8 @@
 package fail2ban
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/swissmakers/fail2ban-ui/internal/shared"
@@ -104,6 +106,108 @@ func TestBuildSSHArgsReverseTunnelForwardTarget(t *testing.T) {
 	if got := findR(noTunnel.buildSSHArgs([]string{"true"})); got != "" {
 		t.Fatalf("unexpected -R arg %q for connector without tunnel", got)
 	}
+}
+
+const sshMuxNoise = "mux_client_request_session: session request failed: Session open refused by peer\r\n" +
+	"ControlSocket /tmp/ssh_control_srv-04e7c5bf2beffe52_172_16_10_13 already exists, disabling multiplexing\n"
+
+func TestSelectCommandOutput(t *testing.T) {
+	jailFile := "[swissmakers-apache-scanner]\nenabled = true\n"
+
+	t.Run("success returns stdout only, stderr noise dropped", func(t *testing.T) {
+		out, err := selectCommandOutput(jailFile, sshMuxNoise, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(out, "mux_client_request_session") || strings.Contains(out, "ControlSocket") {
+			t.Fatalf("stderr noise leaked into output: %q", out)
+		}
+		if out != strings.TrimSpace(jailFile) {
+			t.Fatalf("output = %q, want trimmed stdout", out)
+		}
+	})
+
+	t.Run("failure folds both streams into the error", func(t *testing.T) {
+		out, err := selectCommandOutput("partial", "sudo: a password is required", errors.New("exit status 1"))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "sudo: a password is required") || !strings.Contains(err.Error(), "partial") {
+			t.Fatalf("error should contain both streams, got: %v", err)
+		}
+		if !strings.Contains(out, "sudo: a password is required") {
+			t.Fatalf("returned output should keep error-path matching working, got: %q", out)
+		}
+	})
+}
+
+func TestBuildRemoteWriteScript(t *testing.T) {
+	t.Run("single quotes are preserved verbatim", func(t *testing.T) {
+		content := `ignoreregex = [^"]*(?:Let's Encrypt|Uptime)[^"]*` + "\n"
+		script, err := buildRemoteWriteScript("/etc/fail2ban/filter.d/test.local", content)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(script, "Let's Encrypt") {
+			t.Fatalf("content was altered: %q", script)
+		}
+		if strings.Contains(script, `'"'"'`) {
+			t.Fatalf("content must not be shell-escaped inside a quoted heredoc: %q", script)
+		}
+	})
+
+	t.Run("delimiter collision is rejected", func(t *testing.T) {
+		if _, err := buildRemoteWriteScript("/tmp/f", "a\n"+remoteWriteDelimiter+"\nb\n"); err == nil {
+			t.Fatal("expected error for content containing the heredoc delimiter")
+		}
+	})
+
+	t.Run("unsafe path is rejected", func(t *testing.T) {
+		if _, err := buildRemoteWriteScript("/tmp/f'oo", "x\n"); err == nil {
+			t.Fatal("expected error for path containing a single quote")
+		}
+	})
+
+	t.Run("exactly one trailing newline", func(t *testing.T) {
+		script, err := buildRemoteWriteScript("/tmp/f", "line1\nline2\n")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := "cat > '/tmp/f' <<'" + remoteWriteDelimiter + "'\nline1\nline2\n" + remoteWriteDelimiter + "\n"
+		if script != want {
+			t.Fatalf("script = %q, want %q", script, want)
+		}
+	})
+}
+
+func TestParseLogpathProbe(t *testing.T) {
+	t.Run("NOACCESS marker -> inaccessible sentinel", func(t *testing.T) {
+		_, err := parseLogpathProbe(logpathMarkerNoAccess + "\n")
+		if !errors.Is(err, ErrLogpathInaccessible) {
+			t.Fatalf("want ErrLogpathInaccessible, got %v", err)
+		}
+	})
+	t.Run("NODIR marker -> empty, no error", func(t *testing.T) {
+		files, err := parseLogpathProbe(logpathMarkerNoDir + "\n")
+		if err != nil || len(files) != 0 {
+			t.Fatalf("want empty/no-error, got files=%v err=%v", files, err)
+		}
+	})
+	t.Run("file list parsed", func(t *testing.T) {
+		files, err := parseLogpathProbe("/var/log/httpd/access_log\n/var/log/httpd/ssl_access_log\n")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(files) != 2 || files[0] != "/var/log/httpd/access_log" {
+			t.Fatalf("unexpected files: %v", files)
+		}
+	})
+	t.Run("empty output -> no files, no error", func(t *testing.T) {
+		files, err := parseLogpathProbe("\n  \n")
+		if err != nil || len(files) != 0 {
+			t.Fatalf("want empty/no-error, got files=%v err=%v", files, err)
+		}
+	})
 }
 
 func TestSSHTunnelConfigChanged(t *testing.T) {
