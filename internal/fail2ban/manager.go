@@ -32,10 +32,10 @@ import (
 
 // Connector is the communication backend for a Fail2ban server.
 type Connector interface {
-	ID() string
 	Server() shared.Fail2banServer
 
 	GetJailInfos(ctx context.Context) ([]JailInfo, error)
+	GetJailSummary(ctx context.Context) (*JailSummary, error)
 	GetBannedIPs(ctx context.Context, jail string) ([]string, error)
 	UnbanIP(ctx context.Context, jail, ip string) error
 	BanIP(ctx context.Context, jail, ip string) error
@@ -55,7 +55,6 @@ type Connector interface {
 	// Jail configuration operations
 	GetJailConfig(ctx context.Context, jail string) (string, string, error)
 	SetJailConfig(ctx context.Context, jail, content string) error
-	TestLogpath(ctx context.Context, logpath string) ([]string, error)
 	TestLogpathWithResolution(ctx context.Context, logpath string) (originalPath, resolvedPath string, files []string, err error)
 
 	// Default settings operations
