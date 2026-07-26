@@ -215,7 +215,8 @@ func buildErrorResponse(err error, fallbackKey string) gin.H {
 //  Dashboard
 // =========================================================================
 
-// Returns a JSON summary of all jails for the selected server.
+const summaryBannedPreviewLimit = 5
+
 func SummaryHandler(c *gin.Context) {
 	conn, err := resolveConnector(c)
 	if err != nil {
@@ -223,39 +224,39 @@ func SummaryHandler(c *gin.Context) {
 		return
 	}
 
-	jailInfos, err := conn.GetJailInfos(c.Request.Context())
+	summary, err := conn.GetJailSummary(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, buildErrorResponse(err, "dashboard.errors.summary_failed"))
 		return
 	}
+	resp := SummaryResponse{ServerID: conn.Server().ID, Jails: summary.Jails}
+
 	serverID := conn.Server().ID
 	since := time.Now().UTC().Add(-1 * time.Hour)
 	recentCounts, countErr := storage.CountRecentBanEventsByJail(c.Request.Context(), serverID, since)
 	if countErr != nil {
 		config.DebugLog("Warning: failed to count recent bans for server %s: %v", serverID, countErr)
 	}
-	for i := range jailInfos {
-		jailInfos[i].NewInLastHour = recentCounts[jailInfos[i].JailName]
-		// Summary should only expose counters; banned IPs are loaded lazily via /api/jails/:jail/banned.
-		jailInfos[i].BannedIPs = []string{}
+	for i := range resp.Jails {
+		resp.Jails[i].NewInLastHour = recentCounts[resp.Jails[i].JailName]
+		if len(resp.Jails[i].BannedIPs) > summaryBannedPreviewLimit {
+			resp.Jails[i].BannedIPs = resp.Jails[i].BannedIPs[:summaryBannedPreviewLimit]
+		}
+		if resp.Jails[i].BannedIPs == nil {
+			resp.Jails[i].BannedIPs = []string{}
+		}
 	}
 
-	resp := SummaryResponse{
-		ServerID: serverID,
-		Jails:    jailInfos,
-	}
-
-	// Checks the jail.local integrity on every summary request to warn the user if not managed by Fail2ban-UI.
-	if exists, hasUI, chkErr := conn.CheckJailLocalIntegrity(c.Request.Context()); chkErr == nil {
-		if exists && !hasUI {
-			resp.JailLocalWarning = true
-		} else if !exists {
-			// File was removed (user finished migration) - initialize a fresh managed file
-			if err := conn.EnsureJailLocalStructure(c.Request.Context()); err != nil {
-				config.DebugLog("Warning: failed to initialize jail.local on summary request: %v", err)
-			} else {
-				config.DebugLog("Initialized fresh jail.local for server %s (file was missing)", conn.Server().Name)
-			}
+	// jail.local integrity comes back with the summary itself.
+	switch {
+	case summary.JailLocalExists && !summary.JailLocalManaged:
+		resp.JailLocalWarning = true
+	case !summary.JailLocalExists:
+		// The user finished a migration and removed it -> recreate a managed one.
+		if err := conn.EnsureJailLocalStructure(c.Request.Context()); err != nil {
+			config.DebugLog("Warning: failed to initialize jail.local on summary request: %v", err)
+		} else {
+			config.DebugLog("Initialized fresh jail.local for server %s (file was missing)", conn.Server().Name)
 		}
 	}
 
@@ -309,9 +310,12 @@ func SearchBannedIPHandler(c *gin.Context) {
 				if info.TotalBanned == 0 {
 					continue
 				}
-				banned, err := conn.GetBannedIPs(ctx, info.JailName)
-				if err != nil {
-					continue
+				banned := info.BannedIPs
+				if len(banned) == 0 {
+					banned, err = conn.GetBannedIPs(ctx, info.JailName)
+					if err != nil {
+						continue
+					}
 				}
 				if slices.Contains(banned, ip) {
 					mu.Lock()
