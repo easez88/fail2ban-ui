@@ -90,7 +90,9 @@ function saveJailConfig() {
       } else {
         showToast(t('filter_debug.save_success', 'Filter and jail config saved and reloaded'), 'success');
       }
-      return refreshData({ silent: true });
+      if (data.jailAutoDisabled) {
+        return refreshData({ silent: true, summaryOnly: true });
+      }
     })
     .catch(function(err) {
       console.error("Error saving config:", err);
@@ -209,27 +211,24 @@ function saveManageJailsSingle(checkbox) {
       }
 
       console.log('Jail state saved successfully:', data);
-      if (data.disabledJails && Array.isArray(data.disabledJails) && data.disabledJails.length) {
+      var disabledJails = (data.disabledJails && Array.isArray(data.disabledJails)) ? data.disabledJails : [];
+      if (disabledJails.length) {
         var offenderMsg = t('jails.manage.offender_disabled', "Your change was applied. Unrelated jail '{jail}' has a broken configuration and was automatically disabled.")
-          .replace('{jail}', data.disabledJails.join("', '"));
+          .replace('{jail}', disabledJails.join("', '"));
         showToast(offenderMsg, 'warning', 15000);
       } else {
         showToast(data.message || t(isEnabled ? 'jails.toast.enabled_success' : 'jails.toast.disabled_success', 'Jail {jail} ' + (isEnabled ? 'enabled' : 'disabled') + ' successfully').replace('{jail}', jailName), 'success');
       }
-      return fetch(withServerParam('/api/jails/manage'), {
-        headers: serverHeaders()
-      }).then(function(res) { return res.json(); })
-      .then(function(data) {
-        if (data.jails && data.jails.length) {
-          const jail = data.jails.find(function(j) { return j.jailName === jailName; });
-          if (jail) {
-            checkbox.checked = jail.enabled;
-          }
+      checkbox.checked = disabledJails.indexOf(jailName) !== -1 ? false : isEnabled;
+      disabledJails.forEach(function(name) {
+        var cb = document.getElementById('toggle-' + String(name).replace(/[^a-zA-Z0-9]/g, '_'));
+        if (cb) {
+          cb.checked = false;
         }
-        loadServers().then(function() {
-          updateRestartBanner();
-          return refreshData({ silent: true, summaryOnly: true });
-        });
+      });
+      return loadServers().then(function() {
+        updateRestartBanner();
+        return refreshData({ silent: true, summaryOnly: true });
       });
     })
     .catch(function(err) {
@@ -267,7 +266,7 @@ function deleteJail(jailName) {
       }
       showToast(data.message || t('jails.toast.delete_success', 'Jail deleted successfully'), 'success');
       openManageJailsModal();
-      refreshData({ silent: true });
+      refreshData({ silent: true, summaryOnly: true });
     })
     .catch(function(err) {
       console.error('Error deleting jail:', err);
