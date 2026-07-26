@@ -373,6 +373,40 @@ func parseJailConfigFile(path string) ([]JailInfo, error) {
 	return parseJailConfigContent(string(content)), nil
 }
 
+// Parses jail sections out of a jail.d file body. Shared by the local and SSH
+func parseJailConfigContent(content string) []JailInfo {
+	var jails []JailInfo
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	var currentJail string
+	enabled := true
+
+	ignoredSections := map[string]bool{
+		"DEFAULT":  true,
+		"INCLUDES": true,
+	}
+	flush := func() {
+		if currentJail != "" && !ignoredSections[currentJail] {
+			jails = append(jails, JailInfo{JailName: currentJail, Enabled: enabled})
+		}
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			flush()
+			currentJail = strings.Trim(line, "[]")
+			enabled = true
+		} else if strings.HasPrefix(strings.ToLower(line), "enabled") {
+			parts := strings.Split(line, "=")
+			if len(parts) == 2 {
+				enabled = strings.EqualFold(strings.TrimSpace(parts[1]), "true")
+			}
+		}
+	}
+	flush()
+	return jails
+}
+
 // =========================================================================
 //  Jail Enabled from "Manage Jails"
 // =========================================================================
