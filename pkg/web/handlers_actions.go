@@ -36,6 +36,24 @@ import (
 //  Advanced Actions
 // =========================================================================
 
+func requireConfiguredIntegration(c *gin.Context) (config.AppSettings, bool) {
+	settings := config.GetSettings()
+	if settings.AdvancedActions.Integration == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no integration configured. Please configure an integration (MikroTik, pfSense, or OPNsense) in Advanced Actions settings first"})
+		return settings, false
+	}
+	integration, ok := integrations.Get(settings.AdvancedActions.Integration)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("integration %s not found or not registered", settings.AdvancedActions.Integration)})
+		return settings, false
+	}
+	if err := integration.Validate(settings.AdvancedActions); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("integration configuration is invalid: %v", err)})
+		return settings, false
+	}
+	return settings, true
+}
+
 // Returns the permanent block log entries.
 func ListPermanentBlocksHandler(c *gin.Context) {
 	limit := 100
@@ -89,21 +107,8 @@ func AdvancedActionsTestHandler(c *gin.Context) {
 		return
 	}
 
-	settings := config.GetSettings()
-
-	if settings.AdvancedActions.Integration == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no integration configured. Please configure an integration (MikroTik, pfSense, or OPNsense) in Advanced Actions settings first"})
-		return
-	}
-
-	integration, ok := integrations.Get(settings.AdvancedActions.Integration)
+	settings, ok := requireConfiguredIntegration(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("integration %s not found or not registered", settings.AdvancedActions.Integration)})
-		return
-	}
-
-	if err := integration.Validate(settings.AdvancedActions); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("integration configuration is invalid: %v", err)})
 		return
 	}
 
@@ -165,18 +170,8 @@ func BulkPermanentBlockHandler(c *gin.Context) {
 		return
 	}
 
-	settings := config.GetSettings()
-	if settings.AdvancedActions.Integration == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no integration configured. Please configure an integration (MikroTik, pfSense, or OPNsense) in Advanced Actions settings first"})
-		return
-	}
-	integration, ok := integrations.Get(settings.AdvancedActions.Integration)
+	settings, ok := requireConfiguredIntegration(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("integration %s not found or not registered", settings.AdvancedActions.Integration)})
-		return
-	}
-	if err := integration.Validate(settings.AdvancedActions); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("integration configuration is invalid: %v", err)})
 		return
 	}
 

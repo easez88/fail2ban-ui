@@ -309,25 +309,18 @@ func TestServerHandler(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
-	var (
-		conn fail2ban.Connector
-		err  error
-	)
-
-	switch server.Type {
-	case "local":
-		conn = fail2ban.NewLocalConnector(server)
-	case "ssh":
-		conn, err = fail2ban.NewSSHConnector(server)
-	case "agent":
-		conn, err = fail2ban.NewAgentConnector(server)
-	default:
-		err = fmt.Errorf("unsupported server type %s", server.Type)
-	}
-
+	conn, err := fail2ban.GetManager().Connector(server.ID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, buildErrorResponse(err, "servers.actions.test_failure"))
-		return
+		conn, err = fail2ban.NewConnector(server)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, buildErrorResponse(err, "servers.actions.test_failure"))
+			return
+		}
+		defer func() {
+			if err := conn.Close(); err != nil {
+				config.DebugLog("Warning: failed to close test connector for server %s: %v", server.Name, err)
+			}
+		}()
 	}
 
 	if _, err := conn.GetJailInfos(ctx); err != nil {

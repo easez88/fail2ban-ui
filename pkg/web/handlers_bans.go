@@ -566,7 +566,20 @@ func BanStatisticsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"counts": stats})
 }
 
-// Returns aggregate stats for countries and recurring IPs for ban events.
+// Reports a failed insights sub-query as a 500 and returns true when it did
+func failInsightsQuery(c *gin.Context, query string, err error) bool {
+	if err == nil {
+		return false
+	}
+	errorMsg := err.Error()
+	if config.GetSettings().Debug {
+		config.DebugLog("BanInsightsHandler: %s error: %v", query, err)
+		errorMsg = fmt.Sprintf("%s failed: %v", query, err)
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errorMsg})
+	return true
+}
+
 func BanInsightsHandler(c *gin.Context) {
 	var since time.Time
 	if sinceStr := c.Query("since"); sinceStr != "" {
@@ -619,28 +632,9 @@ func BanInsightsHandler(c *gin.Context) {
 	}()
 	wg.Wait()
 
-	if countriesErr != nil {
-		settings := config.GetSettings()
-		errorMsg := countriesErr.Error()
-		if settings.Debug {
-			config.DebugLog("BanInsightsHandler: CountBanEventsByCountry error: %v", countriesErr)
-			errorMsg = fmt.Sprintf("CountBanEventsByCountry failed: %v", countriesErr)
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errorMsg})
-		return
-	}
-	if recurringErr != nil {
-		settings := config.GetSettings()
-		errorMsg := recurringErr.Error()
-		if settings.Debug {
-			config.DebugLog("BanInsightsHandler: ListRecurringIPStats error: %v", recurringErr)
-			errorMsg = fmt.Sprintf("ListRecurringIPStats failed: %v", recurringErr)
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errorMsg})
-		return
-	}
-	if totalsErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": totalsErr.Error()})
+	if failInsightsQuery(c, "CountBanEventsByCountry", countriesErr) ||
+		failInsightsQuery(c, "ListRecurringIPStats", recurringErr) ||
+		failInsightsQuery(c, "CountBanEventTotals", totalsErr) {
 		return
 	}
 

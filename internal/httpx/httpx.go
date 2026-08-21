@@ -19,8 +19,10 @@ package httpx
 
 import (
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -52,4 +54,22 @@ func Client(timeout time.Duration, skipTLSVerify bool) *http.Client {
 
 func ReadLimited(body io.Reader) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(body, MaxResponseBytes))
+}
+
+// Sends req and turns any 4xx/5xx into an error carrying the capped body
+func DoChecked(client *http.Client, req *http.Request, label string) ([]byte, int, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s request failed: %w", label, err)
+	}
+	defer resp.Body.Close()
+
+	body, readErr := ReadLimited(resp.Body)
+	if resp.StatusCode >= 400 {
+		return body, resp.StatusCode, fmt.Errorf("%s returned status %d: %s", label, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if readErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("%s response could not be read: %w", label, readErr)
+	}
+	return body, resp.StatusCode, nil
 }

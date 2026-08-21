@@ -278,18 +278,12 @@ func sendWebhookAlert(alertType, ip, jail, hostname, failures, whois, logs, coun
 
 	client := httpx.Client(15*time.Second, cfg.SkipTLSVerify)
 
-	resp, err := client.Do(req)
+	_, status, err := httpx.DoChecked(client, req, "webhook")
 	if err != nil {
-		return fmt.Errorf("webhook request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := httpx.ReadLimited(resp.Body)
-		return fmt.Errorf("webhook returned status %d: %s", resp.StatusCode, string(body))
+		return err
 	}
 
-	log.Printf("Webhook alert sent: %s %s -> %d", method, cfg.URL, resp.StatusCode)
+	log.Printf("Webhook alert sent: %s %s -> %d", method, cfg.URL, status)
 	return nil
 }
 
@@ -364,18 +358,12 @@ func sendElasticsearchAlert(alertType, ip, jail, hostname, failures, whois, logs
 
 	client := httpx.Client(15*time.Second, cfg.SkipTLSVerify)
 
-	resp, err := client.Do(req)
+	_, status, err := httpx.DoChecked(client, req, "elasticsearch")
 	if err != nil {
-		return fmt.Errorf("elasticsearch request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := httpx.ReadLimited(resp.Body)
-		return fmt.Errorf("elasticsearch returned status %d: %s", resp.StatusCode, string(body))
+		return err
 	}
 
-	log.Printf("Elasticsearch alert indexed: %s -> %d", reqURL, resp.StatusCode)
+	log.Printf("Elasticsearch alert indexed: %s -> %d", reqURL, status)
 	return nil
 }
 

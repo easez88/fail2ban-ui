@@ -537,19 +537,12 @@ func UpdateJailManagementHandler(c *gin.Context) {
 		errMsg := reloadErr.Error()
 		config.DebugLog("Error: failed to reload fail2ban after updating jail settings: %v", reloadErr)
 
-		if strings.Contains(errMsg, "(output:") {
-			outputStart := strings.Index(errMsg, "(output:") + 8
-			outputEnd := strings.LastIndex(errMsg, ")")
-			if outputEnd > outputStart {
-				detailedErrorOutput = errMsg[outputStart:outputEnd]
-				problematicJails = parseJailErrorsFromReloadOutput(detailedErrorOutput)
-			}
-		} else if strings.Contains(errMsg, "output:") {
-			outputStart := strings.Index(errMsg, "output:") + 7
-			if outputStart < len(errMsg) {
-				detailedErrorOutput = strings.TrimSpace(errMsg[outputStart:])
-				problematicJails = parseJailErrorsFromReloadOutput(detailedErrorOutput)
-			}
+		if output, ok := fail2ban.CommandOutput(reloadErr); ok {
+			detailedErrorOutput = output
+			problematicJails = parseJailErrorsFromReloadOutput(detailedErrorOutput)
+		} else if idx := strings.Index(errMsg, "output:"); idx >= 0 {
+			detailedErrorOutput = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(errMsg[idx+len("output:"):]), ")"))
+			problematicJails = parseJailErrorsFromReloadOutput(detailedErrorOutput)
 		}
 
 		if detailedErrorOutput != "" {
