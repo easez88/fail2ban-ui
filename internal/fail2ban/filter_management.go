@@ -133,20 +133,7 @@ func SetFilterConfigLocal(jail, newContent, configPath string) error {
 
 // Validates a filter name format.
 func ValidateFilterName(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("filter name cannot be empty")
-	}
-
-	if invalidNameChars.MatchString(name) {
-		return fmt.Errorf("filter name '%s' contains invalid characters. Only alphanumeric characters, dashes, and underscores are allowed", name)
-	}
-
-	if name[0] == '-' {
-		return fmt.Errorf("filter name '%s' must not start with a dash", name)
-	}
-
-	return nil
+	return validateConfigName(name, "filter name")
 }
 
 // Lists all filter files in the specified directory.

@@ -114,14 +114,10 @@ func readJailConfigWithFallback(jailName, configPath string) (string, string, er
 //  Validation
 // =========================================================================
 
-var invalidNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 var enabledTruePattern = regexp.MustCompile(`(?m)^\s*enabled\s*=\s*true\s*$`)
 
 func ValidateJailName(name string) error {
 	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("jail name cannot be empty")
-	}
 
 	reservedNames := map[string]bool{
 		"DEFAULT":  true,
@@ -131,15 +127,7 @@ func ValidateJailName(name string) error {
 		return fmt.Errorf("jail name '%s' is reserved and cannot be used", name)
 	}
 
-	if invalidNameChars.MatchString(name) {
-		return fmt.Errorf("jail name '%s' contains invalid characters. Only alphanumeric characters, dashes, and underscores are allowed", name)
-	}
-
-	if name[0] == '-' {
-		return fmt.Errorf("jail name '%s' must not start with a dash", name)
-	}
-
-	return nil
+	return validateConfigName(name, "jail name")
 }
 
 // =========================================================================
@@ -702,14 +690,37 @@ func SetJailConfig(jailName, content, configPath string) error {
 //  Logpath Operations
 // =========================================================================
 
+// Glob variant of shared.ValidateAbsolutePath's charset: same allowlist plus
+// the glob metacharacters '*', '?' and '[]' that logpaths may contain.
+var safeLogpathRe = regexp.MustCompile(`^[A-Za-z0-9 ._/*?\[\]-]+$`)
+
+func sanitizeLogpath(logpath string) (string, error) {
+	logpath = strings.TrimSpace(logpath)
+	if logpath == "" {
+		return "", nil
+	}
+	if strings.ContainsRune(logpath, 0) {
+		return "", fmt.Errorf("invalid log path")
+	}
+	if !filepath.IsAbs(logpath) {
+		return "", fmt.Errorf("log path %q must be absolute", logpath)
+	}
+	if !safeLogpathRe.MatchString(logpath) {
+		return "", fmt.Errorf("log path %q contains unsupported characters", logpath)
+	}
+	if strings.Contains(logpath, "..") {
+		return "", fmt.Errorf("log path %q must not contain '..'", logpath)
+	}
+	return logpath, nil
+}
+
 func TestLogpath(logpath string) ([]string, error) {
+	logpath, err := sanitizeLogpath(logpath)
+	if err != nil {
+		return nil, err
+	}
 	if logpath == "" {
 		return []string{}, nil
-	}
-
-	logpath = strings.TrimSpace(logpath)
-	if strings.ContainsRune(logpath, 0) {
-		return nil, fmt.Errorf("invalid log path")
 	}
 	hasWildcard := strings.ContainsAny(logpath, "*?[")
 
