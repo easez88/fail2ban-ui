@@ -111,6 +111,12 @@ func (m *Manager) ReloadFromServers(servers []shared.Fail2banServer) error {
 	connectors := make(map[string]Connector)
 	defaultID := pickDefaultServerID(servers)
 
+	keep := make(map[string]struct{}, len(servers))
+	for _, srv := range servers {
+		keep[srv.ID] = struct{}{}
+	}
+	pruneHostKeyIssues(keep)
+
 	for _, srv := range servers {
 		if !srv.Enabled {
 			continue
