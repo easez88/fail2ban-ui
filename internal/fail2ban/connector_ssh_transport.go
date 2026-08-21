@@ -57,6 +57,7 @@ func resolveTunnelPort(server shared.Fail2banServer) int {
 }
 
 const sshMaxConcurrentSessions = 4
+const masterRetryBackoff = 30 * time.Second
 
 // Establishes the ControlMaster (which owns the -R reverse forward) unless the connector has been closed
 // Serialized so concurrent commands cannot race to remove and re-create the same control socket
@@ -68,9 +69,13 @@ func (sc *SSHConnector) ensureMaster(ctx context.Context) {
 	}
 	if sc.checkMaster(ctx) {
 		sc.masterUp.Store(true)
+		sc.masterFailUntil = time.Time{}
 		return
 	}
 	sc.masterUp.Store(false)
+	if time.Now().Before(sc.masterFailUntil) {
+		return
+	}
 	if _, err := os.Stat(sc.controlPath()); err == nil {
 		_ = os.Remove(sc.controlPath())
 	}
@@ -79,17 +84,16 @@ func (sc *SSHConnector) ensureMaster(ctx context.Context) {
 		if hk := sc.parseHostKeyError(stderr, err); hk != nil {
 			RecordHostKeyIssue(hk)
 		}
+		sc.masterFailUntil = time.Now().Add(masterRetryBackoff)
 		debugf("SSH control master establish failed for %s: %v", sc.server.Name, err)
 		return
 	}
+	sc.masterFailUntil = time.Time{}
 	sc.masterUp.Store(true)
 }
 
 // Only tunnel servers need a dedicated master (it owns the -R forward)
 func (sc *SSHConnector) ensureMasterLazy(ctx context.Context) {
-	if sc.tunnelPort == 0 {
-		return
-	}
 	if sc.masterUp.Load() {
 		if _, err := os.Stat(sc.controlPath()); err == nil {
 			return
@@ -198,11 +202,7 @@ func (sc *SSHConnector) execSSH(ctx context.Context, args []string, stdin io.Rea
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-
 	err := cmd.Run()
-	if ctx.Err() != nil && cmd.Process != nil && cmd.Process.Pid > 0 {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
 	if err != nil && ctx.Err() != nil {
 		return stdout.String(), stderr.String(), ctx.Err()
 	}
@@ -241,10 +241,30 @@ func summarizeRemoteCommand(command []string) string {
 	return fmt.Sprintf("%s ... (script, %d lines, %d bytes)", truncateForLog(first, 200), lines, len(joined))
 }
 
-func selectCommandOutput(stdout, stderr string, err error) (string, error) {
+type CommandError struct {
+	Kind   string
+	Output string
+	Err    error
+}
+
+func (e *CommandError) Error() string {
+	return fmt.Sprintf("%s command failed: %v (output: %s)", e.Kind, e.Err, truncateForLog(e.Output, maxLoggedOutputBytes))
+}
+
+func (e *CommandError) Unwrap() error { return e.Err }
+
+func CommandOutput(err error) (string, bool) {
+	var ce *CommandError
+	if errors.As(err, &ce) {
+		return ce.Output, true
+	}
+	return "", false
+}
+
+func selectCommandOutput(kind, stdout, stderr string, err error) (string, error) {
 	if err != nil {
 		combined := strings.TrimSpace(strings.TrimSpace(stdout) + "\n" + strings.TrimSpace(stderr))
-		return combined, fmt.Errorf("ssh command failed: %w (output: %s)", err, truncateForLog(combined, maxLoggedOutputBytes))
+		return combined, &CommandError{Kind: kind, Output: combined, Err: err}
 	}
 	return strings.TrimSpace(stdout), nil
 }
@@ -326,7 +346,7 @@ func (sc *SSHConnector) runRemoteCommandOnce(ctx context.Context, command []stri
 	args := sc.buildSSHArgs(command)
 	debugf("SSH command [%s]: %s", sc.server.Name, summarizeSSHInvocation(args, command))
 	stdout, stderr, execErr := sc.execSSH(ctx, args, nil)
-	output, err := selectCommandOutput(stdout, stderr, execErr)
+	output, err := selectCommandOutput("ssh", stdout, stderr, execErr)
 	if err != nil {
 		if hk := sc.parseHostKeyError(stderr, err); hk != nil {
 			RecordHostKeyIssue(hk)
