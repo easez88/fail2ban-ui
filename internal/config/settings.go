@@ -103,6 +103,7 @@ type AdvancedActionsConfig struct {
 	Mikrotik    MikrotikIntegrationSettings `json:"mikrotik"`
 	PfSense     PfSenseIntegrationSettings  `json:"pfSense"`
 	OPNsense    OPNsenseIntegrationSettings `json:"opnsense"`
+	UniFi       UniFiIntegrationSettings    `json:"unifi"`
 }
 
 type MikrotikIntegrationSettings struct {
@@ -129,6 +130,14 @@ type OPNsenseIntegrationSettings struct {
 	APISecret     string `json:"apiSecret"`
 	Alias         string `json:"alias"`
 	SkipTLSVerify bool   `json:"skipTLSVerify"`
+}
+
+type UniFiIntegrationSettings struct {
+	BaseURL         string `json:"baseUrl"`
+	APIKey          string `json:"apiKey"`
+	SiteName        string `json:"siteName"`
+	TrafficListName string `json:"trafficListName"`
+	SkipTLSVerify   bool   `json:"skipTLSVerify"`
 }
 
 type WebhookSettings struct {

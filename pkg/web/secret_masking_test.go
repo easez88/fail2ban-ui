@@ -108,6 +108,7 @@ func settingsWithAllSecrets() (config.AppSettings, map[string]func(*config.AppSe
 		"PfSense.APISecret":      func(s *config.AppSettings) *string { return &s.AdvancedActions.PfSense.APISecret },
 		"OPNsense.APIKey":        func(s *config.AppSettings) *string { return &s.AdvancedActions.OPNsense.APIKey },
 		"OPNsense.APISecret":     func(s *config.AppSettings) *string { return &s.AdvancedActions.OPNsense.APISecret },
+		"UniFi.APIKey":           func(s *config.AppSettings) *string { return &s.AdvancedActions.UniFi.APIKey },
 	}
 	for name, get := range fields {
 		*get(&s) = "secret-" + name
