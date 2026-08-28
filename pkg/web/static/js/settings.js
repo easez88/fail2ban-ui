@@ -570,6 +570,18 @@ function applyAdvancedActionsSettings(cfg) {
   const opnTLS = document.getElementById('opnsenseSkipTLS');
   if (opnTLS) opnTLS.checked = !!opn.skipTLSVerify;
 
+  const unifi = cfg.unifi || {};
+  const unifiURL = document.getElementById('unifiBaseURL');
+  if (unifiURL) unifiURL.value = unifi.baseUrl || '';
+  const unifiKey = document.getElementById('unifiAPIKey');
+  if (unifiKey) unifiKey.value = unifi.apiKey || '';
+  const unifiSite = document.getElementById('unifiSiteName');
+  if (unifiSite) unifiSite.value = unifi.siteName || 'Default';
+  const unifiList = document.getElementById('unifiListName');
+  if (unifiList) unifiList.value = unifi.trafficListName || 'Fail2Ban-Permanent-Block';
+  const unifiTLS = document.getElementById('unifiSkipTLS');
+  if (unifiTLS) unifiTLS.checked = !!unifi.skipTLSVerify;
+
   updateAdvancedIntegrationFields();
 }
 
@@ -599,6 +611,15 @@ function collectAdvancedActionsSettings() {
       apiSecret: document.getElementById('opnsenseSecret').value.trim(),
       alias: document.getElementById('opnsenseAlias').value.trim(),
       skipTLSVerify: document.getElementById('opnsenseSkipTLS').checked,
+    },
+    unifi: {
+      baseUrl: document.getElementById('unifiBaseURL').value.trim(),
+      apiKey: document.getElementById('unifiAPIKey').value,
+      siteName: document.getElementById('unifiSiteName').value.trim(),
+      trafficListName:
+        document.getElementById('unifiListName').value.trim()
+        || 'Fail2Ban-Permanent-Block',
+      skipTLSVerify: document.getElementById('unifiSkipTLS').checked,
     }
   };
 }
@@ -608,6 +629,7 @@ function updateAdvancedIntegrationFields() {
   document.getElementById('advancedMikrotikFields').classList.toggle('hidden', selected !== 'mikrotik');
   document.getElementById('advancedPfSenseFields').classList.toggle('hidden', selected !== 'pfsense');
   document.getElementById('advancedOPNsenseFields').classList.toggle('hidden', selected !== 'opnsense');
+  document.getElementById('advancedUniFiFields').classList.toggle('hidden', selected !== 'unifi');
 }
 
 // =========================================================================

@@ -51,6 +51,7 @@ func maskAppSettingsSecrets(s config.AppSettings) config.AppSettings {
 	s.AdvancedActions.PfSense.APISecret = maskSecret(s.AdvancedActions.PfSense.APISecret)
 	s.AdvancedActions.OPNsense.APIKey = maskSecret(s.AdvancedActions.OPNsense.APIKey)
 	s.AdvancedActions.OPNsense.APISecret = maskSecret(s.AdvancedActions.OPNsense.APISecret)
+	s.AdvancedActions.UniFi.APIKey = maskSecret(s.AdvancedActions.UniFi.APIKey)
 
 	if len(s.Webhook.Headers) > 0 {
 		masked := make(map[string]string, len(s.Webhook.Headers))
@@ -78,6 +79,7 @@ func restoreMaskedSecrets(req *config.AppSettings, stored config.AppSettings) {
 	req.AdvancedActions.PfSense.APISecret = restoreSecret(req.AdvancedActions.PfSense.APISecret, stored.AdvancedActions.PfSense.APISecret)
 	req.AdvancedActions.OPNsense.APIKey = restoreSecret(req.AdvancedActions.OPNsense.APIKey, stored.AdvancedActions.OPNsense.APIKey)
 	req.AdvancedActions.OPNsense.APISecret = restoreSecret(req.AdvancedActions.OPNsense.APISecret, stored.AdvancedActions.OPNsense.APISecret)
+	req.AdvancedActions.UniFi.APIKey = restoreSecret(req.AdvancedActions.UniFi.APIKey, stored.AdvancedActions.UniFi.APIKey)
 
 	for k, v := range req.Webhook.Headers {
 		if v == secretMaskSentinel {
